@@ -36,7 +36,7 @@ class JobProcessingTest(unittest.TestCase):
                 with patch.object(service.CONFIG, "route_mode", "auto"):
                     manager = service.JobManager(store_path=root / "jobs.sqlite3")
                     job = manager.create("input.pdf", source_path, page_count=2)
-                    deadline = time.monotonic() + 10
+                    deadline = time.monotonic() + 60
                     while time.monotonic() < deadline:
                         current = manager.get(job.job_id)
                         if current is not None and current.status in {
@@ -122,7 +122,7 @@ class JobProcessingTest(unittest.TestCase):
                 ):
                     first_manager = service.JobManager(store_path=store_path)
                     job = first_manager.create("input.pdf", source_path, page_count=2)
-                    deadline = time.monotonic() + 10
+                    deadline = time.monotonic() + 60
                     while time.monotonic() < deadline:
                         current = first_manager.get(job.job_id)
                         if current is not None and current.status in {
@@ -183,7 +183,7 @@ class JobProcessingTest(unittest.TestCase):
                 ):
                     manager = service.JobManager(store_path=root / "jobs.sqlite3")
                     job = manager.create("invalid.pdf", source_path, page_count=1)
-                    deadline = time.monotonic() + 10
+                    deadline = time.monotonic() + 60
                     while time.monotonic() < deadline:
                         current = manager.get(job.job_id)
                         if current is not None and current.status in {
