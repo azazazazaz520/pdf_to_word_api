@@ -33,9 +33,7 @@ class JobProcessingTest(unittest.TestCase):
             manager = None
 
             try:
-                with patch.object(service.CONFIG, "route_mode", "auto"), patch.object(
-                    service.CONFIG, "export_mode", "text"
-                ):
+                with patch.object(service.CONFIG, "route_mode", "auto"):
                     manager = service.JobManager(store_path=root / "jobs.sqlite3")
                     job = manager.create("input.pdf", source_path, page_count=2)
                     deadline = time.monotonic() + 10
@@ -120,8 +118,8 @@ class JobProcessingTest(unittest.TestCase):
 
             try:
                 with patch.object(service.CONFIG, "route_mode", "auto"), patch.object(
-                    service.CONFIG, "export_mode", "text"
-                ), patch.object(service.CONFIG, "max_retries", 0):
+                    service.CONFIG, "max_retries", 0
+                ):
                     first_manager = service.JobManager(store_path=store_path)
                     job = first_manager.create("input.pdf", source_path, page_count=2)
                     deadline = time.monotonic() + 10
