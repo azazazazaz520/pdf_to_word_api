@@ -1,0 +1,360 @@
+"""版面提取的数据契约：页面、文本行、表格、矢量与图片的表示。
+
+本模块不依赖同包其他模块，是拆包后的共同依赖层。
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any
+from collections import Counter
+from ..fonts.resolver import style_key as font_style_key
+from ..pdf_routing import normalize_page_text
+
+_PAGEOBJ_PATH = 2
+
+
+_PAGEOBJ_TEXT = 1
+
+
+_PAGEOBJ_IMAGE = 3
+
+
+_MAX_LINE_THICKNESS = 2.0
+
+
+_MIN_HORIZONTAL_LINE_LENGTH = 20.0
+
+
+_MIN_VERTICAL_LINE_LENGTH = 10.0
+
+
+_COORDINATE_TOLERANCE = 2.5
+
+
+_MAX_TABLE_ROW_GAP = 60.0
+
+
+_MIN_TABLE_WIDTH = 60.0
+
+
+_MIN_CELL_LINE_LENGTH = 8.0
+
+
+_MIN_BOUNDARY_COVERAGE = 0.6
+
+
+@dataclass(frozen=True)
+class PdfTextSpan:
+    """同一行内具有相同字体/字号/颜色的连续文本片段。"""
+
+    text: str
+    bbox: tuple[float, float, float, float]
+    font_name: str = ""
+    pdf_font_name: str = ""
+    font_size: float = 0.0
+    color: tuple[int, int, int] = (0, 0, 0)
+    bold: bool = False
+    italic: bool = False
+    rotation: float = 0.0
+    z_order: int = 0
+    substituted: bool = False
+    fallback_reason: str = ""
+
+    @property
+    def x0(self) -> float:
+        return self.bbox[0]
+
+    @property
+    def top(self) -> float:
+        return self.bbox[1]
+
+    @property
+    def x1(self) -> float:
+        return self.bbox[2]
+
+    @property
+    def bottom(self) -> float:
+        return self.bbox[3]
+
+
+@dataclass(frozen=True)
+class PdfTextLine:
+    """保存可用于阅读顺序和列表识别的 PDF 文本行。
+
+    高保真字段（字体、颜色、对齐、行距、z-order）默认值保持向后兼容，
+    只有 ``include_fidelity=True`` 时才会被填充。
+    """
+
+    text: str
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    font_size: float
+    is_header_footer: bool = False
+    font_name: str = ""
+    color: tuple[int, int, int] = (0, 0, 0)
+    bold: bool = False
+    italic: bool = False
+    alignment: str = "left"
+    line_spacing: float = 0.0
+    first_line_indent: float = 0.0
+    rotation: float = 0.0
+    z_order: int = 0
+    layer: str = "body"
+    confidence: float | None = None
+    spans: tuple[PdfTextSpan, ...] = ()
+    pdf_font_name: str = ""
+    font_substituted: bool = False
+    font_fallback_reason: str = ""
+
+    @property
+    def center_x(self) -> float:
+        return (self.x0 + self.x1) / 2
+
+    @property
+    def center_y(self) -> float:
+        return (self.top + self.bottom) / 2
+
+    @property
+    def width(self) -> float:
+        return max(self.x1 - self.x0, 0.0)
+
+    @property
+    def height(self) -> float:
+        return max(self.bottom - self.top, 0.0)
+
+
+@dataclass(frozen=True)
+class PdfImageBlock:
+    """保存页面内嵌图片的位置和原始图像数据。"""
+
+    name: str
+    bbox: tuple[float, float, float, float]
+    width: float
+    height: float
+    data: bytes
+    mime_type: str = "image/png"
+    source: str = "embedded"
+    z_order: int = 0
+    is_logo: bool = False
+    layer: str = "body"
+
+
+@dataclass(frozen=True)
+class PdfVectorObject:
+    """保存页面矢量对象（线条、矩形、路径）的几何和样式。"""
+
+    kind: str
+    bbox: tuple[float, float, float, float]
+    stroke_color: tuple[int, int, int] | None = None
+    fill_color: tuple[int, int, int] | None = None
+    stroke_width: float = 0.0
+    segments: tuple[tuple[str, float, float], ...] = ()
+    closed: bool = False
+    complex: bool = False
+    dashed: bool = False
+    filled: bool = True
+    stroked: bool = True
+    z_order: int = 0
+    layer: str = "body"
+
+    @property
+    def width(self) -> float:
+        return max(self.bbox[2] - self.bbox[0], 0.0)
+
+    @property
+    def height(self) -> float:
+        return max(self.bbox[3] - self.bbox[1], 0.0)
+
+
+@dataclass(frozen=True)
+class PdfTableCell:
+    """保存表格单元格的网格位置、跨行跨列信息和文本。"""
+
+    row_index: int
+    column_index: int
+    row_span: int
+    column_span: int
+    bbox: tuple[float, float, float, float]
+    text: str
+    text_bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    border_widths: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    border_color: tuple[int, int, int] = (0, 0, 0)
+    font_size: float = 0.0
+    bold: bool = False
+    alignment: str = "left"
+
+
+@dataclass(frozen=True)
+class PdfTable:
+    """保存 PDF 几何表格的边界、列边界、行边界和单元格。"""
+
+    bbox: tuple[float, float, float, float]
+    column_boundaries: tuple[float, ...]
+    row_boundaries: tuple[float, ...]
+    rows: tuple[tuple[str, ...], ...]
+    cells: tuple[PdfTableCell, ...] = ()
+    header_row_count: int = 1
+    continued_from_previous_page: bool = False
+    continuation_header_rows: tuple[tuple[str, ...], ...] = ()
+    border_width: float = 0.0
+    border_color: tuple[int, int, int] = (0, 0, 0)
+    has_borders: bool = True
+    z_order: int = 0
+
+    @property
+    def column_count(self) -> int:
+        return max(len(self.column_boundaries) - 1, 0)
+
+    @property
+    def row_count(self) -> int:
+        return max(len(self.row_boundaries) - 1, 0)
+
+    @property
+    def row_heights(self) -> tuple[float, ...]:
+        """返回每一行在 PDF 中的高度，单位为 point。"""
+        return tuple(
+            max(self.row_boundaries[index + 1] - self.row_boundaries[index], 0.0)
+            for index in range(self.row_count)
+        )
+
+
+@dataclass(frozen=True)
+class PdfPageLayout:
+    """保存单页的尺寸、文本行、几何表格和矢量对象。"""
+
+    width: float
+    height: float
+    lines: tuple[PdfTextLine, ...]
+    tables: tuple[PdfTable, ...]
+    images: tuple[PdfImageBlock, ...] = ()
+    columns: tuple[float, ...] = ()
+    vectors: tuple[PdfVectorObject, ...] = ()
+    has_page_background: bool = False
+
+
+@dataclass(frozen=True)
+class PdfDocumentLayout:
+    """保存 PDF 全文的布局中间模型。"""
+
+    pages: tuple[PdfPageLayout, ...]
+
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
+
+    @property
+    def table_count(self) -> int:
+        return sum(len(page.tables) for page in self.pages)
+
+
+@dataclass(frozen=True)
+class _HorizontalLine:
+    top: float
+    x0: float
+    x1: float
+    segments: tuple[tuple[float, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class _VerticalLine:
+    x: float
+    top: float
+    bottom: float
+
+
+@dataclass(frozen=True)
+class _TableCandidate:
+    """保存表格候选区域及其可用于识别合并单元格的线段。"""
+
+    bbox: tuple[float, float, float, float]
+    column_boundaries: tuple[float, ...]
+    row_boundaries: tuple[float, ...]
+    horizontal_lines: tuple[_HorizontalLine, ...]
+    vertical_lines: tuple[_VerticalLine, ...]
+
+
+@dataclass
+class _TextCharacter:
+    text: str
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    font_size: float
+    is_header_footer: bool = False
+    font_name: str = ""
+    color: tuple[int, int, int] = (0, 0, 0)
+    bold: bool = False
+    italic: bool = False
+    rotation: float = 0.0
+    z_order: int = 0
+    pdf_font_name: str = ""
+    font_substituted: bool = False
+    font_fallback_reason: str = ""
+
+    def style_key(self) -> tuple[Any, ...]:
+        return font_style_key(
+            self.font_name,
+            self.font_size,
+            self.color,
+            self.bold,
+            self.italic,
+            self.rotation,
+        )
+
+    @property
+    def center_x(self) -> float:
+        return (self.x0 + self.x1) / 2
+
+    @property
+    def center_y(self) -> float:
+        return (self.top + self.bottom) / 2
+
+
+@dataclass
+class _TextObjectStyle:
+    """一个 PDF 文本对象的字体、颜色和层级信息。"""
+
+    bbox: tuple[float, float, float, float]
+    font_name: str
+    font_size: float
+    color: tuple[int, int, int]
+    bold: bool
+    italic: bool
+    z_order: int
+    rotation: float = 0.0
+    pdf_font_name: str = ""
+    substituted: bool = False
+    fallback_reason: str = ""
+
+    @property
+    def area(self) -> float:
+        return max(self.bbox[2] - self.bbox[0], 0.0) * max(
+            self.bbox[3] - self.bbox[1], 0.0
+        )
+
+
+def _compact_text(value: str) -> str:
+    return normalize_page_text(value.replace("\r", "\n")).replace("\n", " ")
+
+
+def _same_text_band(left: _TextCharacter, right: _TextCharacter) -> bool:
+    overlap = min(left.bottom, right.bottom) - max(left.top, right.top)
+    minimum_height = min(left.bottom - left.top, right.bottom - right.top)
+    if overlap >= minimum_height * 0.35:
+        return True
+    return abs(left.center_y - right.center_y) <= max(
+        6.0,
+        max(left.font_size, right.font_size) * 0.6,
+    )
+
+
+def _dominant_value(values: list[Any], default: Any) -> Any:
+    if not values:
+        return default
+    counts = Counter(values)
+    return counts.most_common(1)[0][0]
+
+
