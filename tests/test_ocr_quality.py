@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.ocr_quality import summarize_ocr_page
+from src.service.ocr_quality import summarize_ocr_page
 
 
 class OcrQualityTest(unittest.TestCase):

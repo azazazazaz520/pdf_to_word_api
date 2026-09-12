@@ -9,7 +9,7 @@ from unittest.mock import patch
 from docx import Document
 from reportlab.pdfgen.canvas import Canvas
 
-import src.pdf_to_word_service as service
+import src.service.app as service
 
 
 def _create_text_pdf(path: Path) -> None:
