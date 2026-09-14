@@ -54,6 +54,18 @@ def _write_text_pdf(path: Path, page_count: int = 1) -> None:
     canvas.save()
 
 
+def _write_dense_text_pdf(path: Path) -> None:
+    canvas = Canvas(str(path), pagesize=(595.0, 842.0))
+    canvas.setFont("Helvetica", 9)
+    for line_number in range(60):
+        canvas.drawString(
+            72,
+            800 - line_number * 12,
+            f"Dense text line {line_number} remains editable in the output.",
+        )
+    canvas.save()
+
+
 def _write_mixed_pdf(path: Path, image_path: Path) -> None:
     canvas = Canvas(str(path), pagesize=(360, 240))
     canvas.drawString(36, 200, "First page is editable text with enough characters.")
@@ -86,6 +98,22 @@ class PdfWorkerFidelityTest(unittest.TestCase):
                 document_xml = archive.read("word/document.xml").decode("utf-8")
             self.assertIn("<w:framePr", document_xml)
             self.assertNotIn('w:top="504"', document_xml)
+
+    def test_dense_text_page_stays_on_text_route(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "dense-text.pdf"
+            _write_dense_text_pdf(pdf_path)
+            payload = _base_payload(root, pdf_path, page_count=1)
+
+            result = process_job(payload)
+
+            self.assertEqual(result["status"], "succeeded")
+            quality = result["quality"]
+            self.assertEqual(quality["route_summary"], {"text": 1})
+            self.assertEqual(quality["visual_only_page_count"], 0)
+            self.assertEqual(quality["page_results"][0]["route"], "text")
+            self.assertTrue(quality["page_results"][0]["editable"])
 
     def test_fidelity_keeps_text_for_visual_pages(self) -> None:
         with TemporaryDirectory() as temporary_directory:
