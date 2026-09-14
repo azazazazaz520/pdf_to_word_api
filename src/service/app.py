@@ -27,6 +27,8 @@ from fastapi.responses import FileResponse
 from pypdf import PdfReader
 
 from ..export.document_setup import DEFAULT_PAGE_IMAGE_JPEG_QUALITY, DEFAULT_PAGE_IMAGE_MAX_PIXELS
+from ..export.fidelity import FIDELITY_MODES
+from ..export.structured import STRUCTURED_MODES
 from ..pdf_worker import process_job
 from .jobs import JobStore
 
@@ -34,9 +36,23 @@ from .jobs import JobStore
 ROOT = Path(__file__).resolve().parents[2]  # 仓库根：src/service/app.py → 上溯两层
 LOGGER = logging.getLogger("pdf_to_word_service")
 ROUTE_MODES = frozenset({"auto", "text", "ocr"})
-EXPORT_MODE = "fidelity"
-"""程序只使用一种转换模式：高保真绝对定位。"""
+EXPORT_MODES = STRUCTURED_MODES | FIDELITY_MODES
+_CONFIGURED_EXPORT_MODE = os.getenv(
+    "PDF_SERVICE_EXPORT_MODE", "structured"
+).strip().lower()
+if _CONFIGURED_EXPORT_MODE not in EXPORT_MODES:
+    raise RuntimeError(
+        "环境变量 PDF_SERVICE_EXPORT_MODE 必须是 structured、flow、fidelity 或 fidelity_hybrid"
+    )
+EXPORT_MODE = (
+    "structured" if _CONFIGURED_EXPORT_MODE == "flow" else _CONFIGURED_EXPORT_MODE
+)
+"""默认使用结构化流式导出；fidelity 可用于显式保留绝对定位兼容路径。"""
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "timed_out"})
+
+
+def _canonical_export_mode(value: str) -> str:
+    return "structured" if value == "flow" else value
 
 
 def _env_int(name: str, default: int) -> int:
@@ -428,6 +444,13 @@ class JobManager:
     @staticmethod
     def _job_from_record(record: dict[str, Any]) -> Job | None:
         try:
+            stored_export_mode = str(
+                record.get("export_mode") or EXPORT_MODE
+            ).strip().lower()
+            if stored_export_mode in {"hybrid", "flow"}:
+                stored_export_mode = "structured"
+            if stored_export_mode not in EXPORT_MODES:
+                stored_export_mode = EXPORT_MODE
             return Job(
                 job_id=str(record["job_id"]),
                 owner_id=(
@@ -457,7 +480,7 @@ class JobManager:
                     else {}
                 ),
                 route_mode=str(record.get("route_mode") or "auto"),
-                export_mode=EXPORT_MODE,
+                export_mode=stored_export_mode,
                 worker_pid=(
                     int(record["worker_pid"])
                     if record.get("worker_pid") is not None
@@ -488,9 +511,16 @@ class JobManager:
         *,
         owner_id: str | None = None,
         route_mode: str | None = None,
+        export_mode: str | None = None,
     ) -> Job:
         selected_route_mode = route_mode or CONFIG.route_mode
-        selected_export_mode = EXPORT_MODE
+        selected_export_mode = _canonical_export_mode(
+            (export_mode or EXPORT_MODE).strip().lower()
+        )
+        if selected_export_mode not in EXPORT_MODES:
+            raise ValueError(
+                "export_mode 必须是 structured、flow、fidelity 或 fidelity_hybrid"
+            )
         with self._lock:
             if self._active_job_count_locked() >= CONFIG.max_pending_jobs:
                 raise QueueFullError("任务队列已满，请稍后重试")
@@ -1140,6 +1170,7 @@ def health() -> dict[str, Any]:
         "text_full_page_image_min_pixels": CONFIG.text_full_page_image_min_pixels,
         "text_garbled_char_ratio": CONFIG.text_garbled_char_ratio,
         "export_mode": EXPORT_MODE,
+        "export_modes": sorted(EXPORT_MODES),
         "model_loaded": manager.model_loaded(),
         "max_upload_bytes": CONFIG.max_upload_bytes,
         "max_pages": CONFIG.max_pages,
@@ -1164,6 +1195,7 @@ def health() -> dict[str, Any]:
 async def create_job(
     file: UploadFile = File(...),
     route_mode: str | None = Form(None),
+    export_mode: str | None = Form(None),
     identity: AuthenticatedIdentity = Depends(_require_auth),
 ) -> dict[str, Any]:
     selected_route_mode = (route_mode or CONFIG.route_mode).strip().lower()
@@ -1171,6 +1203,14 @@ async def create_job(
         raise HTTPException(
             status_code=400,
             detail="route_mode 必须是 auto、text 或 ocr",
+        )
+    selected_export_mode = _canonical_export_mode(
+        (export_mode or EXPORT_MODE).strip().lower()
+    )
+    if selected_export_mode not in EXPORT_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail="export_mode 必须是 structured、flow、fidelity 或 fidelity_hybrid",
         )
     manager = _get_manager()
     manager.cleanup_expired()
@@ -1188,6 +1228,7 @@ async def create_job(
             page_count,
             owner_id=identity.user_id,
             route_mode=selected_route_mode,
+            export_mode=selected_export_mode,
         )
         return job.as_dict()
     except HTTPException:

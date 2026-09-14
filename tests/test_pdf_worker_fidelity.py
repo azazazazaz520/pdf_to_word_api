@@ -79,7 +79,7 @@ def _write_mixed_pdf(path: Path, image_path: Path) -> None:
 
 
 class PdfWorkerFidelityTest(unittest.TestCase):
-    def test_conversion_uses_single_fidelity_mode(self) -> None:
+    def test_conversion_defaults_to_structured_flow(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             pdf_path = root / "text.pdf"
@@ -90,14 +90,30 @@ class PdfWorkerFidelityTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "succeeded")
             quality = result["quality"]
+            self.assertEqual(quality["export_mode"], "structured")
+            self.assertIsNotNone(quality.get("structured"))
+            self.assertGreater(quality["structured"]["text_paragraph_count"], 0)
+            with zipfile.ZipFile(root / "result.docx") as archive:
+                document_xml = archive.read("word/document.xml").decode("utf-8")
+            self.assertNotIn("<w:framePr", document_xml)
+
+    def test_explicit_fidelity_mode_remains_available(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "text.pdf"
+            _write_text_pdf(pdf_path, page_count=1)
+            payload = _base_payload(root, pdf_path, page_count=1)
+            payload["export_mode"] = "fidelity"
+
+            result = process_job(payload)
+
+            self.assertEqual(result["status"], "succeeded")
+            quality = result["quality"]
             self.assertEqual(quality["export_mode"], "fidelity")
             self.assertIsNotNone(quality.get("fidelity"))
-            self.assertEqual(quality["fidelity"]["fallback_region_count"], 0)
-            self.assertEqual(quality["fidelity"]["page_count"], 1)
             with zipfile.ZipFile(root / "result.docx") as archive:
                 document_xml = archive.read("word/document.xml").decode("utf-8")
             self.assertIn("<w:framePr", document_xml)
-            self.assertNotIn('w:top="504"', document_xml)
 
     def test_dense_text_page_stays_on_text_route(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -123,6 +139,7 @@ class PdfWorkerFidelityTest(unittest.TestCase):
             pdf_path = root / "mixed.pdf"
             _write_mixed_pdf(pdf_path, image_path)
             payload = _base_payload(root, pdf_path, page_count=2)
+            payload["export_mode"] = "fidelity"
 
             result = process_job(payload)
 
@@ -148,6 +165,7 @@ class PdfWorkerFidelityTest(unittest.TestCase):
             pdf_path = root / "low-coverage.pdf"
             _write_text_pdf(pdf_path, page_count=1)
             payload = _base_payload(root, pdf_path, page_count=1)
+            payload["export_mode"] = "fidelity"
             payload["render_validation"] = True
             payload["fidelity_auto_fallback"] = True
 

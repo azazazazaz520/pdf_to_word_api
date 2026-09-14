@@ -84,7 +84,7 @@ class JobStore:
                     table_count INTEGER NOT NULL DEFAULT 0,
                     quality_json TEXT,
                     route_mode TEXT NOT NULL DEFAULT 'auto',
-                    export_mode TEXT NOT NULL DEFAULT 'hybrid',
+                    export_mode TEXT NOT NULL DEFAULT 'structured',
                     created_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
@@ -119,7 +119,7 @@ class JobStore:
                 )
             if "export_mode" not in columns:
                 connection.execute(
-                    "ALTER TABLE jobs ADD COLUMN export_mode TEXT NOT NULL DEFAULT 'hybrid'"
+                    "ALTER TABLE jobs ADD COLUMN export_mode TEXT NOT NULL DEFAULT 'structured'"
                 )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_created "

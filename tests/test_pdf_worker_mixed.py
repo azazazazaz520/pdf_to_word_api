@@ -6,7 +6,9 @@ import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from docx import Document
 from PIL import Image
+from pypdf import PdfReader
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
@@ -61,6 +63,28 @@ def _base_payload(root: Path, pdf_path: Path, page_count: int) -> dict:
 
 
 class PdfWorkerMixedRouteTest(unittest.TestCase):
+    def test_structured_worker_exports_detected_pdf_table(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = (
+                Path(__file__).resolve().parents[1]
+                / "fixtures"
+                / "synthetic_text_table.pdf"
+            )
+            payload = _base_payload(
+                root,
+                pdf_path,
+                page_count=len(PdfReader(str(pdf_path)).pages),
+            )
+            payload["export_mode"] = "structured"
+
+            result = process_job(payload)
+
+            self.assertEqual(result["status"], "succeeded")
+            quality = result["quality"]
+            self.assertEqual(quality["structured"]["table_count"], 1)
+            self.assertEqual(len(Document(root / "result.docx").tables), 1)
+
     def test_text_page_keeps_embedded_image(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -85,13 +109,17 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
             quality = result["quality"]
             self.assertEqual(quality["route_summary"], {"text": 1})
             self.assertEqual(quality["media_count"], 1)
+            self.assertEqual(quality["structured"]["image_count"], 1)
             with zipfile.ZipFile(root / "result.docx") as archive:
+                document_xml = archive.read("word/document.xml").decode("utf-8")
                 media = [
                     name
                     for name in archive.namelist()
                     if name.startswith("word/media/")
                 ]
             self.assertEqual(len(media), 1)
+            self.assertIn("<wp:inline", document_xml)
+            self.assertNotIn("<w:framePr", document_xml)
 
     def test_mixed_document_keeps_text_on_visual_pages(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -152,6 +180,7 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
             canvas.save()
 
             payload = _base_payload(root, pdf_path, page_count=2)
+            payload["export_mode"] = "fidelity"
             fake_pipeline = _FakeOcrPipeline()
             with patch.object(
                 pdf_worker,
@@ -196,6 +225,7 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
             canvas.drawString(36, 200, "Render validation text page.")
             canvas.save()
             payload = _base_payload(root, pdf_path, page_count=1)
+            payload["export_mode"] = "fidelity"
             payload["render_validation"] = True
             payload["render_timeout_seconds"] = 60
 
@@ -288,6 +318,58 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
                 and check["status"] == "failed"
                 for check in gate["checks"]
             )
+        )
+
+    def test_structured_quality_gate_allows_expected_reflow(self) -> None:
+        quality = {
+            "export_mode": "structured",
+            "render_validation": {
+                "status": "succeeded",
+                "source_page_count": 20,
+                "page_delta": 10,
+                "blank_pages": [],
+            },
+        }
+
+        gate = _evaluate_quality_gate(
+            quality,
+            enabled=True,
+            page_delta_warn_ratio=0.05,
+            page_delta_warn_absolute=3,
+        )
+
+        self.assertEqual(gate["status"], "passed")
+        self.assertIn(
+            "structured_reflow_allowed=True",
+            next(
+                check["detail"]
+                for check in gate["checks"]
+                if check["name"] == "render_page_delta"
+            ),
+        )
+
+    def test_structured_render_validation_uses_reflow_acceptance(self) -> None:
+        quality = {"export_mode": "structured", "needs_review_pages": []}
+        pdf_worker._merge_render_validation(
+            quality,
+            {
+                "status": "succeeded",
+                "source_page_count": 20,
+                "rendered_page_count": 22,
+                "page_delta": 2,
+                "blank_pages": [],
+                "unexpected_blank_pages": [],
+            },
+            expected_source_page_count=20,
+            ssim_threshold=0.98,
+        )
+
+        self.assertIn("structured_acceptance", quality)
+        self.assertNotIn("fidelity_acceptance", quality)
+        self.assertEqual(quality["needs_review_pages"], [])
+        self.assertEqual(
+            quality["warnings"][0]["code"],
+            "render_page_reflow",
         )
 
     def test_quality_gate_fails_fidelity_mismatch_with_matching_page_count(self) -> None:

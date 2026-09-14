@@ -20,7 +20,12 @@ from .layout.layout import extract_pdf_layout
 from .pdf_routing import analyze_pdf_text
 from .service.ocr_quality import summarize_ocr_page
 from .export.document_setup import page_render_scale
-from .export.fidelity import DEFAULT_FIDELITY_FALLBACK_DPI, export_fidelity_docx
+from .export.fidelity import (
+    DEFAULT_FIDELITY_FALLBACK_DPI,
+    FIDELITY_MODES,
+    export_fidelity_docx,
+)
+from .export.structured import STRUCTURED_MODES, export_structured_docx
 from .page_render import render_page_image
 from .run_validation import build_pipeline
 
@@ -34,6 +39,7 @@ def _prepare_fonts(
     writer: Any,
     route: str,
     route_reason: str,
+    calibrate_offsets: bool = True,
 ) -> tuple[Any, dict[str, float], dict[str, Any], dict[str, Any] | None]:
     """构建字体嵌入计划并标定 framePr 偏移。
 
@@ -68,7 +74,10 @@ def _prepare_fonts(
                 embedded_font_bytes=font_plan.report()["embedded_font_bytes"],
                 fallback_fonts=font_plan.report()["fallback_fonts"],
             )
-            if bool(payload.get("calibrate_font_metrics", True)):
+            if (
+                calibrate_offsets
+                and bool(payload.get("calibrate_font_metrics", True))
+            ):
                 try:
                     metric_requests: list[FontMetricRequest] = []
                     seen_fonts: set[str] = set()
@@ -138,7 +147,7 @@ def _run_render_validation(
     route: str,
     route_reason: str,
 ) -> dict[str, Any]:
-    """渲染回读并执行保真验收；不修改 IR，也不使用整页图片兜底。"""
+    """渲染回读并按导出模式执行验收；不修改 IR，也不替换页面内容。"""
     if bool(payload.get("render_validation", False)):
         render_started = time.perf_counter()
         try:
@@ -188,10 +197,15 @@ def _run_render_validation(
                 expected_source_page_count=expected_source_page_count,
                 ssim_threshold=ssim_threshold,
             )
-            acceptance = quality.get("fidelity_acceptance") or {}
+            acceptance_key = (
+                "structured_acceptance"
+                if quality.get("export_mode") in {"structured", "flow"}
+                else "fidelity_acceptance"
+            )
+            acceptance = quality.get(acceptance_key) or {}
             if toc_extra_pages:
                 acceptance["toc_extra_pages"] = toc_extra_pages
-                quality["fidelity_acceptance"] = acceptance
+                quality[acceptance_key] = acceptance
             # 保留字段以兼容旧版质量报告；当前策略永远不替换页面内容。
             quality["fidelity_auto_fallback_pages"] = []
             writer.emit(
@@ -244,7 +258,11 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     cancel_path = Path(payload["cancel_path"])
     page_count = int(payload["page_count"])
     route_mode = str(payload.get("route_mode", "auto"))
-    export_mode = "fidelity"
+    export_mode = str(payload.get("export_mode") or "structured").strip().lower()
+    if export_mode == "flow":
+        export_mode = "structured"
+    if export_mode not in STRUCTURED_MODES | FIDELITY_MODES:
+        raise ValueError(f"不支持的 DOCX 导出模式：{export_mode}")
     engine = str(payload.get("engine", "structure-lite"))
     task_started = time.perf_counter()
     task_timeout_seconds = float(payload.get("task_timeout_seconds", 300.0))
@@ -272,7 +290,12 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         if stage == "ir_page_completed":
             page_number = int(details.get("page") or 0)
             progress = min(90, 60 + int(30 * page_number / total_pages))
+        elif stage == "structured_page_completed":
+            page_number = int(details.get("page") or 0)
+            progress = min(90, 60 + int(30 * page_number / total_pages))
         elif stage == "ir_export_completed":
+            progress = 95
+        elif stage == "structured_export_completed":
             progress = 95
         clean_details = dict(details)
         clean_details.pop("route", None)
@@ -619,6 +642,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             writer=writer,
             route=route,
             route_reason=route_reason,
+            calibrate_offsets=export_mode in FIDELITY_MODES,
         )
         quality = ir.quality_report(compact=page_count > 200)
 
@@ -632,25 +656,41 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             ir_media_count=ir.media_count,
         )
         export_started = time.perf_counter()
-        fidelity_report = export_fidelity_docx(
-            ir,
-            output_path,
-            title=Path(str(payload["filename"])).stem,
-            source_pdf=input_path,
-            include_toc=bool(payload.get("include_toc", False)),
-            include_bookmarks=bool(payload.get("include_bookmarks", True)),
-            mode="fidelity",
-            min_text_confidence=payload.get("fidelity_min_text_confidence"),
-            fallback_dpi=float(payload.get("fidelity_fallback_dpi", 200.0)),
-            fallback_max_pixels=int(
-                payload.get("fidelity_fallback_max_pixels", 2_000_000)
-            ),
-            font_plan=font_plan,
-            font_offsets=font_offsets,
-            font_programs=font_programs,
-            stage_callback=emit_export_stage,
-        )
-        quality["fidelity"] = fidelity_report
+        if export_mode in STRUCTURED_MODES:
+            structured_report = export_structured_docx(
+                ir,
+                output_path,
+                title=Path(str(payload["filename"])).stem,
+                source_pdf=input_path,
+                include_toc=bool(payload.get("include_toc", False)),
+                include_bookmarks=bool(payload.get("include_bookmarks", True)),
+                max_fallback_pixels=int(
+                    payload.get("fidelity_fallback_max_pixels", 2_000_000)
+                ),
+                font_plan=font_plan,
+                stage_callback=emit_export_stage,
+            )
+            quality["structured"] = structured_report
+        else:
+            fidelity_report = export_fidelity_docx(
+                ir,
+                output_path,
+                title=Path(str(payload["filename"])).stem,
+                source_pdf=input_path,
+                include_toc=bool(payload.get("include_toc", False)),
+                include_bookmarks=bool(payload.get("include_bookmarks", True)),
+                mode=export_mode,
+                min_text_confidence=payload.get("fidelity_min_text_confidence"),
+                fallback_dpi=float(payload.get("fidelity_fallback_dpi", 200.0)),
+                fallback_max_pixels=int(
+                    payload.get("fidelity_fallback_max_pixels", 2_000_000)
+                ),
+                font_plan=font_plan,
+                font_offsets=font_offsets,
+                font_programs=font_programs,
+                stage_callback=emit_export_stage,
+            )
+            quality["fidelity"] = fidelity_report
         font_usage_report = ir.font_usage()
         font_plan_report = font_plan.report() if font_plan is not None else None
         quality["fonts"] = {

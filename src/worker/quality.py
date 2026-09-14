@@ -74,12 +74,18 @@ def _evaluate_quality_gate(
         page_delta_warn_absolute,
         int(source_page_count * page_delta_warn_ratio),
     )
+    structured_mode = quality.get("export_mode") in {"structured", "flow"}
     checks = [
         {
             "name": "render_page_delta",
-            "status": "passed" if abs(page_delta) <= delta_threshold else "failed",
+            "status": (
+                "passed"
+                if structured_mode or abs(page_delta) <= delta_threshold
+                else "failed"
+            ),
             "detail": (
                 f"page_delta={page_delta}, threshold={delta_threshold}"
+                + (", structured_reflow_allowed=True" if structured_mode else "")
             ),
         },
         {
@@ -89,7 +95,7 @@ def _evaluate_quality_gate(
         },
     ]
     fidelity_acceptance = quality.get("fidelity_acceptance")
-    if isinstance(fidelity_acceptance, dict):
+    if isinstance(fidelity_acceptance, dict) and not structured_mode:
         for key, name in (
             ("page_count_match", "fidelity_page_count"),
             ("no_unexpected_blank_pages", "fidelity_blank_pages"),
@@ -232,6 +238,32 @@ def _apply_fidelity_acceptance(
         )
 
 
+def _apply_structured_acceptance(
+    quality: dict[str, Any],
+    render_result: dict[str, Any],
+    *,
+    ssim_threshold: float,
+) -> None:
+    """记录结构化导出的渲染信息；允许正文重排，不按坐标判定失败。"""
+    ssim = render_result.get("ssim") or {}
+    text_coverage = render_result.get("text_coverage") or {}
+    quality["structured_acceptance"] = {
+        "page_count_match": render_result.get("page_delta") == 0,
+        "reflow_allowed": True,
+        "no_unexpected_blank_pages": not render_result.get(
+            "unexpected_blank_pages"
+        ),
+        "ssim_available": ssim.get("status") == "succeeded",
+        "ssim_threshold": ssim_threshold,
+        "min_ssim": ssim.get("min_ssim"),
+        "pages_below_threshold": ssim.get("pages_below_threshold", []),
+        "text_coverage": text_coverage,
+        "unexpected_blank_pages": render_result.get(
+            "unexpected_blank_pages", []
+        ),
+    }
+
+
 def _merge_render_validation(
     quality: dict[str, Any],
     render_result: dict[str, Any],
@@ -244,15 +276,17 @@ def _merge_render_validation(
     quality["page_delta"] = render_result["page_delta"]
     quality["blank_pages"] = render_result["blank_pages"]
     quality["render_validation"] = render_result
+    structured_mode = quality.get("export_mode") in {"structured", "flow"}
     if render_result["page_delta"] != 0:
         _append_quality_warning(
             quality,
-            code="render_page_mismatch",
+            code=("render_page_reflow" if structured_mode else "render_page_mismatch"),
             message=(
                 f"Word 渲染页数 {render_result['rendered_page_count']} "
                 f"与源页数 {expected_source_page_count} 不一致。"
             ),
             page=expected_source_page_count,
+            severity="info" if structured_mode else "warning",
         )
     for blank_page in render_result.get(
         "unexpected_blank_pages",
@@ -264,8 +298,15 @@ def _merge_render_validation(
             message=f"第 {blank_page} 页在 Word 渲染结果中为空白页。",
             page=blank_page,
         )
-    _apply_fidelity_acceptance(
-        quality,
-        render_result,
-        ssim_threshold=ssim_threshold,
-    )
+    if structured_mode:
+        _apply_structured_acceptance(
+            quality,
+            render_result,
+            ssim_threshold=ssim_threshold,
+        )
+    else:
+        _apply_fidelity_acceptance(
+            quality,
+            render_result,
+            ssim_threshold=ssim_threshold,
+        )

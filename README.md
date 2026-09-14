@@ -102,7 +102,7 @@ Prism 客户端使用 Supabase 匿名会话产生的短期 JWT 调用上述接�
 - `PDF_SERVICE_TEXT_HIGH_QUALITY_RATIO`：文本层质量足够高的页面占比阈值，默认 0.8；低于该阈值时自动使用页面保真路线。
 - `PDF_SERVICE_TEXT_FULL_PAGE_IMAGE_MIN_PIXELS`：识别全页背景图像的最小像素数，默认 300000。
 - `PDF_SERVICE_TEXT_GARBLED_CHAR_RATIO`：异常字形比例阈值，默认 0.05。
-- 转换模式固定为 `fidelity`：一页一个 section，可重建内容按源坐标绝对定位，无法重建的区域贴原区域图片；不再提供 `hybrid`、`flow`、`text` 等运行期模式选择，也没有对应的环境变量。
+- `PDF_SERVICE_EXPORT_MODE`：默认 `structured`。普通正文输出为可重排的 Word 段落；识别出的表格输出为原生 Word 表格，公式优先输出 OMML，图片输出为内嵌图片。可选 `fidelity` 或 `fidelity_hybrid` 保留按源坐标绝对定位的兼容路径，`flow` 是 `structured` 的兼容别名；也可在创建任务时通过 multipart 的 `export_mode` 覆盖默认值。
 - `PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS`：整页图像像素上限，默认 4194304。
 - `PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY`：混合模式页面图像 JPEG 质量，默认 88。
 - `PDF_SERVICE_TOKEN`：服务端长期内部令牌，必须配置；仍支持使用该令牌进行服务端管理调用。
@@ -146,4 +146,4 @@ OCR 任务会在 `stages.jsonl` 中为每个页面记录识别行数、平均和
 - 目标 PDF 回归验证：`U202442475闫耀天.pdf` 经 API 端到端处理成功，4 页文本层完整，源文本与 DOCX 正文比对未发现实质性漏字或误合并，Word 实际渲染无额外白页。
 - WeKnora 结构回归验证：`WeKnora论文测试报告.pdf` 经文本层 Worker 端到端处理成功，恢复 15 个标题节点、9 个真实 Word 表格和项目符号列表；Word 渲染为 7 页 A4，未发现额外空白页或表格裁切。
 
-验证目录中的 `fixtures` PDF 是合成样本；真实扫描 PDF、复杂表格、多栏文档、旋转页面、图片和公式仍需补充样本后单独验收。转换固定使用 `fidelity` 模式：可重建内容按源坐标绝对定位，无法重建的区域自动贴原区域图片并写入质量报告，因此不存在"改用其他模式换取可编辑性"的选项——可编辑程度由质量报告中的 `fallback_regions` 与 `needs_review_pages` 反映。页面图像像素上限可通过环境变量调整。
+验证目录中的 `fixtures` PDF 是合成样本；真实扫描 PDF、复杂表格、多栏文档、旋转页面、图片和公式仍需补充样本后单独验收。默认 `structured` 模式优先保证内容结构和编辑性，正文允许随 Word 页面宽度重排；`fidelity` 模式用于需要保留源坐标的兼容场景。结构化导出中的公式、表格和图片降级情况会写入 `quality.structured`，页面级复核信息仍由 `needs_review_pages` 提供。页面图像像素上限可通过环境变量调整。
