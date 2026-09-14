@@ -11,6 +11,7 @@ from html.parser import HTMLParser
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 from docx import Document
@@ -28,12 +29,14 @@ from ..page_render import (
     _add_toc_field,
     _bookmark_name,
 )
+from ..ooxml_positioning import add_absolute_picture, new_canvas_paragraph
 from .document_setup import (
     StageCallback,
     _notify_stage,
     _remove_initial_empty_paragraph,
     _set_document_styles,
     _set_section_page,
+    render_page_image_png,
     render_pdf_region,
 )
 from .table_render import _add_pdf_table
@@ -197,8 +200,16 @@ def _configure_paragraph(paragraph: Any, block: IRBlock | None = None) -> None:
     alignment = str(block.alignment or "").lower()
     if alignment in _ALIGNMENTS:
         paragraph.alignment = _ALIGNMENTS[alignment]
-    if block.line_spacing > 0:
-        paragraph.paragraph_format.line_spacing = Pt(block.line_spacing)
+    # The layout annotator stores line_spacing as a multiple of the source
+    # font size (for example 1.10), not as an absolute point value.  Passing
+    # that multiple directly to Pt() produces a roughly 1-point exact line
+    # height and makes every wrapped line overlap.
+    if block.line_spacing > 0 and len(block.lines) > 1:
+        font_size = float(block.font_size or 0.0)
+        if font_size > 0:
+            paragraph.paragraph_format.line_spacing = Pt(
+                max(font_size * float(block.line_spacing), font_size)
+            )
     if block.first_line_indent > 0:
         paragraph.paragraph_format.first_line_indent = Pt(block.first_line_indent)
 
@@ -370,6 +381,406 @@ def _render_block_region(
         )
     except Exception:
         return None
+
+
+def _is_grid_like_text_block(block: IRBlock) -> bool:
+    """判断文本块是否由多个横向单元格组成，而非连续正文。"""
+    lines = list(block.lines or ())
+    if len(lines) < 4 or block.bbox is None:
+        return False
+    if any(
+        str(line.text or "").lstrip().startswith(("•", "·", "●", "▪", "◦"))
+        for line in lines
+    ):
+        return False
+    rows: list[list[IRTextLine]] = []
+    for line in sorted(
+        lines,
+        key=lambda item: (
+            (float(item.bbox[1]) + float(item.bbox[3])) / 2.0,
+            float(item.bbox[0]),
+        ),
+    ):
+        center = (float(line.bbox[1]) + float(line.bbox[3])) / 2.0
+        font_size = max(float(line.font_size or 0.0), 1.0)
+        tolerance = max(1.5, min(4.0, font_size * 0.45))
+        if rows:
+            previous = rows[-1]
+            previous_center = sum(
+                (float(item.bbox[1]) + float(item.bbox[3])) / 2.0
+                for item in previous
+            ) / len(previous)
+            if abs(center - previous_center) <= tolerance:
+                previous.append(line)
+                continue
+        rows.append([line])
+    multi_line_rows = sum(len(row) >= 2 for row in rows)
+    return len(rows) >= 2 and multi_line_rows >= 2
+
+
+def _is_colliding_text_block(block: IRBlock) -> bool:
+    """检测同一文本行中互相覆盖、导致字符交错的 PDF 文本层。"""
+    lines = list(block.lines or ())
+    if len(lines) != 1:
+        return False
+    spans = list(lines[0].spans or ())
+    if len(spans) < 8:
+        return False
+    font_size = max(float(lines[0].font_size or 0.0), 1.0)
+    vertical_range = max(float(span.bbox[3]) for span in spans) - min(
+        float(span.bbox[1]) for span in spans
+    )
+    overlaps = sum(
+        min(float(left.bbox[2]), float(right.bbox[2]))
+        > max(float(left.bbox[0]), float(right.bbox[0]))
+        for left, right in zip(spans, spans[1:])
+    )
+    return vertical_range > font_size * 0.65 and overlaps >= 3
+
+
+def _table_cell_line_count(value: Any) -> int:
+    return sum(bool(line.strip()) for line in str(value or "").splitlines())
+
+
+def _table_has_overfull_cells(table: Any) -> bool:
+    """识别表格解析把多条物理行压进同一个单元格的情况。"""
+    cells = list(getattr(table, "cells", ()) or ())
+    if not cells or int(getattr(table, "column_count", 0) or 0) < 2:
+        return False
+    for cell in cells:
+        line_count = _table_cell_line_count(getattr(cell, "text", ""))
+        if line_count < 2:
+            continue
+        bbox = getattr(cell, "bbox", None)
+        if not bbox or len(bbox) < 4:
+            continue
+        cell_height = max(float(bbox[3]) - float(bbox[1]), 0.0)
+        font_size = max(float(getattr(cell, "font_size", 0.0) or 0.0), 6.0)
+        required_height = line_count * font_size * 1.05
+        if required_height > cell_height + 4.0:
+            return True
+    return False
+
+
+def _horizontal_overlap_ratio(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    overlap = max(min(left[2], right[2]) - max(left[0], right[0]), 0.0)
+    denominator = max(min(left[2] - left[0], right[2] - right[0]), 1.0)
+    return overlap / denominator
+
+
+def _complex_table_regions(page: IRPage) -> tuple[tuple[float, float, float, float], ...]:
+    """合并同一复杂表格被边框检测拆开的相邻区域。"""
+    table_blocks = [
+        block
+        for block in page.body_blocks
+        if block.kind == "table"
+        and block.bbox is not None
+        and _table_has_overfull_cells(block.table)
+    ]
+    if not table_blocks:
+        return ()
+
+    all_table_blocks = [
+        block
+        for block in page.body_blocks
+        if block.kind == "table" and block.bbox is not None
+    ]
+    regions: list[tuple[float, float, float, float]] = []
+    used: set[int] = set()
+    for seed in table_blocks:
+        seed_index = all_table_blocks.index(seed)
+        if seed_index in used:
+            continue
+        selected = [seed]
+        used.add(seed_index)
+        changed = True
+        while changed:
+            changed = False
+            current_region = (
+                min(float(block.bbox[0]) for block in selected if block.bbox),
+                min(float(block.bbox[1]) for block in selected if block.bbox),
+                max(float(block.bbox[2]) for block in selected if block.bbox),
+                max(float(block.bbox[3]) for block in selected if block.bbox),
+            )
+            for index, candidate in enumerate(all_table_blocks):
+                if index in used or candidate.bbox is None:
+                    continue
+                candidate_bbox = tuple(float(value) for value in candidate.bbox)
+                vertical_gap = max(
+                    candidate_bbox[1] - current_region[3],
+                    current_region[1] - candidate_bbox[3],
+                    0.0,
+                )
+                if (
+                    _horizontal_overlap_ratio(current_region, candidate_bbox)
+                    >= 0.8
+                    and vertical_gap <= 120.0
+                ):
+                    selected.append(candidate)
+                    used.add(index)
+                    changed = True
+        x0 = max(min(float(block.bbox[0]) for block in selected if block.bbox) - 2.0, 0.0)
+        top = max(min(float(block.bbox[1]) for block in selected if block.bbox) - 2.0, 0.0)
+        x1 = min(max(float(block.bbox[2]) for block in selected if block.bbox) + 2.0, page.width)
+        bottom = min(max(float(block.bbox[3]) for block in selected if block.bbox) + 2.0, page.height)
+        regions.append((x0, top, x1, bottom))
+    return tuple(sorted(regions, key=lambda bbox: (bbox[1], bbox[0])))
+
+
+def _block_overlaps_region(
+    block: IRBlock,
+    region: tuple[float, float, float, float],
+) -> bool:
+    if block.bbox is None:
+        return False
+    x0, top, x1, bottom = (float(value) for value in block.bbox)
+    rx0, rtop, rx1, rbottom = region
+    overlap_x = min(x1, rx1) - max(x0, rx0)
+    center_y = (top + bottom) / 2.0
+    return overlap_x > 0.0 and rtop <= center_y <= rbottom
+
+
+def _is_formula_block_candidate(block: IRBlock) -> bool:
+    if block.bbox is None:
+        return False
+    text = str(block.text or "").strip()
+    if not text or len(text) > 90:
+        return False
+    marks = len(re.findall(r"[=≤≥≈+\-*/^_()]", text))
+    return block.kind == "formula" and marks >= 2
+
+
+def _is_compact_formula_fragment(block: IRBlock) -> bool:
+    if block.bbox is None:
+        return False
+    text = str(block.text or "").strip()
+    if not text or text.endswith((".", "。", ":", "：")):
+        return False
+    if block.kind == "formula":
+        return _is_formula_block_candidate(block) or len(text) <= 24
+    if len(text) > 24:
+        return False
+    if block.kind not in FLOW_TEXT_KINDS:
+        return False
+    if _is_formula_block_candidate(block):
+        return True
+    if len(text) > 10 or re.search(r"\b(?:the|and|of|with|from|where)\b", text, re.I):
+        return False
+    return bool(
+        re.fullmatch(r"[A-Za-z0-9α-ωΑ-Ω₀-₉⁰-⁹\s()\[\]{}_^+\-*/=]+", text)
+    )
+
+
+def _formula_regions(page: IRPage) -> tuple[tuple[float, float, float, float], ...]:
+    """合并公式及其分数线/上下标碎片，按源 PDF 区域转图。"""
+    blocks = [block for block in page.body_blocks if block.bbox is not None]
+    seeds = [block for block in blocks if _is_formula_block_candidate(block)]
+    regions: list[tuple[float, float, float, float]] = []
+    used: set[int] = set()
+    for seed in seeds:
+        seed_index = blocks.index(seed)
+        if seed_index in used:
+            continue
+        selected = [seed]
+        selected_indices = {seed_index}
+        changed = True
+        while changed:
+            changed = False
+            region = (
+                min(float(block.bbox[0]) for block in selected if block.bbox),
+                min(float(block.bbox[1]) for block in selected if block.bbox),
+                max(float(block.bbox[2]) for block in selected if block.bbox),
+                max(float(block.bbox[3]) for block in selected if block.bbox),
+            )
+            for index, candidate in enumerate(blocks):
+                if index in selected_indices or not _is_compact_formula_fragment(candidate):
+                    continue
+                candidate_bbox = tuple(float(value) for value in candidate.bbox)
+                vertical_gap = max(
+                    candidate_bbox[1] - region[3],
+                    region[1] - candidate_bbox[3],
+                    0.0,
+                )
+                horizontal_gap = max(
+                    candidate_bbox[0] - region[2],
+                    region[0] - candidate_bbox[2],
+                    0.0,
+                )
+                vertical_overlap = min(candidate_bbox[3], region[3]) - max(
+                    candidate_bbox[1], region[1]
+                )
+                if (
+                    vertical_gap <= 14.0
+                    and (vertical_overlap > 0.0 or horizontal_gap <= 12.0)
+                ):
+                    selected.append(candidate)
+                    selected_indices.add(index)
+                    changed = True
+        if len(selected) < 2:
+            continue
+        used.update(selected_indices)
+        regions.append(
+            (
+                max(min(float(block.bbox[0]) for block in selected if block.bbox) - 4.0, 0.0),
+                max(min(float(block.bbox[1]) for block in selected if block.bbox) - 4.0, 0.0),
+                min(max(float(block.bbox[2]) for block in selected if block.bbox) + 4.0, page.width),
+                min(max(float(block.bbox[3]) for block in selected if block.bbox) + 4.0, page.height),
+            )
+        )
+    return tuple(sorted(regions, key=lambda bbox: (bbox[1], bbox[0])))
+
+
+def _add_text_region_fallback(
+    document: Any,
+    page: IRPage,
+    block: IRBlock,
+    *,
+    source_pdf: Path | None,
+    margin_points: float,
+    max_fallback_pixels: int,
+    report: dict[str, Any],
+    reason: str = "complex_text_grid_rasterized",
+) -> Any | None:
+    """复杂文本网格局部转图，避免误套列表样式破坏版式。"""
+    image_bytes = _render_block_region(
+        source_pdf,
+        page,
+        block,
+        max_pixels=max_fallback_pixels,
+    )
+    if not image_bytes:
+        return None
+    image_block = IRBlock(
+        kind="image",
+        page=block.page,
+        bbox=block.bbox,
+        image_bytes=image_bytes,
+        image_width=block.width,
+        image_height=block.height,
+        image_alt="复杂文本块局部图像",
+        source="text_grid_fallback",
+    )
+    paragraph = _add_inline_image(
+        document,
+        image_block,
+        page,
+        margin_points=margin_points,
+    )
+    if paragraph is None:
+        return None
+    report["text_image_fallback_count"] += 1
+    _record_placement(
+        report,
+        block,
+        status="image_fallback",
+        reason=reason,
+    )
+    return paragraph
+
+
+def _add_rotated_text_fallback(
+    document: Any,
+    page: IRPage,
+    block: IRBlock,
+    *,
+    source_pdf: Path | None,
+    max_fallback_pixels: int,
+    report: dict[str, Any],
+) -> Any | None:
+    """把旋转文本作为页面锚定局部图像，避免旋转被错误地横排。"""
+    if block.bbox is None:
+        return None
+    image_bytes = _render_block_region(
+        source_pdf,
+        page,
+        block,
+        max_pixels=max_fallback_pixels,
+    )
+    if not image_bytes:
+        return None
+    x0, top, x1, bottom = (float(value) for value in block.bbox)
+    width = max(x1 - x0, 0.5)
+    height = max(bottom - top, 0.5)
+    paragraph = new_canvas_paragraph(document)
+    add_absolute_picture(
+        document,
+        image_bytes,
+        x_points=x0,
+        y_points=top,
+        width_points=width,
+        height_points=height,
+        z_order=block.z_order,
+        object_id=1000 + len(report["placements"]),
+        name=f"rotated_text_{page.page_number}_{len(report['placements'])}",
+        paragraph=paragraph,
+    )
+    report["rotated_text_image_fallback_count"] += 1
+    _record_placement(
+        report,
+        block,
+        status="image_fallback",
+        reason="rotated_text_page_anchor",
+    )
+    return paragraph
+
+
+def _should_use_page_image_fallback(
+    page: IRPage,
+    *,
+    source_pdf: Path | None,
+) -> bool:
+    """为旋转图表页启用页级保真图，避免逐词拼装破坏图形。"""
+    if source_pdf is None or not source_pdf.is_file():
+        return False
+    rotated_count = sum(
+        abs(float(block.rotation or 0.0)) >= 1.0
+        for block in page.body_blocks
+        if block.kind in FLOW_TEXT_KINDS
+    )
+    vector_count = sum(block.kind == "vector" for block in page.body_blocks)
+    return rotated_count >= 8 and vector_count >= DENSE_VECTOR_LIMIT
+
+
+def _add_page_image_fallback(
+    document: Any,
+    page: IRPage,
+    *,
+    source_pdf: Path | None,
+    max_fallback_pixels: int,
+    report: dict[str, Any],
+) -> Any | None:
+    """把无法可靠流式重建的复杂页面作为单个页面锚定图像。"""
+    if source_pdf is None:
+        return None
+    try:
+        image_bytes = render_page_image_png(
+            source_pdf,
+            page.page_number - 1,
+            dpi=144.0,
+            max_pixels=max_fallback_pixels,
+        )
+    except Exception:
+        return None
+    paragraph = new_canvas_paragraph(document)
+    add_absolute_picture(
+        document,
+        image_bytes,
+        x_points=0.0,
+        y_points=0.0,
+        width_points=max(page.width, 0.5),
+        height_points=max(page.height, 0.5),
+        z_order=0,
+        object_id=2000 + len(report["placements"]),
+        name=f"page_image_{page.page_number}",
+        behind_text=True,
+        paragraph=paragraph,
+    )
+    report["page_image_fallback_count"] += 1
+    report["visual_only_page_count"] += 1
+    return paragraph
 
 
 def _vector_union_bbox(page: IRPage) -> tuple[float, float, float, float] | None:
@@ -661,6 +1072,42 @@ def _add_page_block(
     report: dict[str, Any],
 ) -> Any | None:
     if block.kind in FLOW_TEXT_KINDS:
+        if abs(float(block.rotation or 0.0)) >= 1.0:
+            paragraph = _add_rotated_text_fallback(
+                document,
+                page,
+                block,
+                source_pdf=source_pdf,
+                max_fallback_pixels=max_fallback_pixels,
+                report=report,
+            )
+            if paragraph is not None:
+                return paragraph
+        if _is_colliding_text_block(block):
+            paragraph = _add_text_region_fallback(
+                document,
+                page,
+                block,
+                source_pdf=source_pdf,
+                margin_points=margin_points,
+                max_fallback_pixels=max_fallback_pixels,
+                report=report,
+                reason="colliding_text_rasterized",
+            )
+            if paragraph is not None:
+                return paragraph
+        if _is_grid_like_text_block(block):
+            paragraph = _add_text_region_fallback(
+                document,
+                page,
+                block,
+                source_pdf=source_pdf,
+                margin_points=margin_points,
+                max_fallback_pixels=max_fallback_pixels,
+                report=report,
+            )
+            if paragraph is not None:
+                return paragraph
         paragraph = _add_text_block(document, block, font_plan=font_plan)
         report["text_paragraph_count"] += 1
         _record_placement(report, block, status="native", reason="flow_paragraph")
@@ -834,14 +1281,20 @@ def export_structured_docx(
         "mode": "structured",
         "page_count": len(ir.pages),
         "text_paragraph_count": 0,
+        "text_image_fallback_count": 0,
+        "rotated_text_image_fallback_count": 0,
         "table_count": 0,
         "html_table_count": 0,
         "formula_count": 0,
         "formula_omml_count": 0,
         "formula_image_fallback_count": 0,
+        "formula_region_fallback_count": 0,
         "formula_text_fallback_count": 0,
         "image_count": 0,
         "page_image_count": 0,
+        "page_image_fallback_count": 0,
+        "visual_only_page_count": 0,
+        "complex_table_region_fallback_count": 0,
         "vector_image_fallback_count": 0,
         "vector_compacted_page_count": 0,
         "vector_skipped_count": 0,
@@ -868,7 +1321,11 @@ def export_structured_docx(
             max(page.height / 72.0, 0.01),
             margin_points / 72.0,
         )
-        if page.header_blocks or page.footer_blocks:
+        page_image_fallback = _should_use_page_image_fallback(
+            page,
+            source_pdf=source_pdf,
+        )
+        if not page_image_fallback and (page.header_blocks or page.footer_blocks):
             _add_flow_header_footer(
                 section,
                 page,
@@ -879,6 +1336,46 @@ def export_structured_docx(
             detach_header_footer(section)
 
         start_index = len(report["placements"])
+        if page_image_fallback:
+            first_paragraph = _add_page_image_fallback(
+                document,
+                page,
+                source_pdf=source_pdf,
+                max_fallback_pixels=max_fallback_pixels,
+                report=report,
+            )
+            if first_paragraph is not None:
+                fallback_block = IRBlock(
+                    kind="page_image",
+                    page=page.page_number,
+                    bbox=(0.0, 0.0, page.width, page.height),
+                    source="complex_rotated_page_fallback",
+                )
+                _record_placement(
+                    report,
+                    fallback_block,
+                    status="image_fallback",
+                    reason="complex_rotated_page_rasterized",
+                )
+                if include_bookmarks:
+                    for entry in outline_by_page.get(page.page_number, []):
+                        bookmark_id += 1
+                        _add_bookmark(
+                            first_paragraph,
+                            name=_bookmark_name(
+                                str(entry.get("title") or ""),
+                                bookmark_id,
+                            ),
+                            bookmark_id=bookmark_id,
+                        )
+                _record_page_report(report, page, start_index=start_index)
+                _notify_stage(
+                    stage_callback,
+                    "structured_page_completed",
+                    page=page.page_number,
+                    page_count=len(ir.pages),
+                )
+                continue
         first_paragraph = None
         vector_blocks = [
             block for block in page.body_blocks if block.kind == "vector"
@@ -904,7 +1401,135 @@ def export_structured_docx(
             )
             report["vector_compacted_page_count"] += 1
         dense_vector_inserted = False
+        complex_table_regions = []
+        for region in _complex_table_regions(page):
+            region_block = IRBlock(
+                kind="image",
+                page=page.page_number,
+                bbox=region,
+                image_width=region[2] - region[0],
+                image_height=region[3] - region[1],
+                image_alt="复杂表格区域",
+                source="complex_table_region_fallback",
+            )
+            image_bytes = _render_block_region(
+                source_pdf,
+                page,
+                region_block,
+                max_pixels=max_fallback_pixels,
+            )
+            if image_bytes:
+                region_block.image_bytes = image_bytes
+                complex_table_regions.append(
+                    {"region": region, "block": region_block, "inserted": False}
+                )
+        formula_regions = []
+        for region in _formula_regions(page):
+            region_block = IRBlock(
+                kind="image",
+                page=page.page_number,
+                bbox=region,
+                image_width=region[2] - region[0],
+                image_height=region[3] - region[1],
+                image_alt="复杂公式区域",
+                source="formula_region_fallback",
+            )
+            image_bytes = _render_block_region(
+                source_pdf,
+                page,
+                region_block,
+                max_pixels=max_fallback_pixels,
+            )
+            if image_bytes:
+                region_block.image_bytes = image_bytes
+                formula_regions.append(
+                    {
+                        "region": region,
+                        "block": region_block,
+                        "inserted": False,
+                        "formula_count": sum(
+                            item.kind == "formula"
+                            and _block_overlaps_region(item, region)
+                            for item in page.body_blocks
+                        ),
+                    }
+                )
         for block in page.body_blocks:
+            table_region = next(
+                (
+                    item
+                    for item in complex_table_regions
+                    if _block_overlaps_region(block, item["region"])
+                ),
+                None,
+            )
+            if table_region is not None:
+                if not table_region["inserted"]:
+                    paragraph = _add_inline_image(
+                        document,
+                        table_region["block"],
+                        page,
+                        margin_points=margin_points,
+                    )
+                    if paragraph is not None:
+                        table_region["inserted"] = True
+                        report["table_image_fallback_count"] += 1
+                        report["complex_table_region_fallback_count"] += 1
+                        _record_placement(
+                            report,
+                            block,
+                            status="image_fallback",
+                            reason="complex_table_region_rasterized",
+                        )
+                        if first_paragraph is None:
+                            first_paragraph = paragraph
+                        continue
+                elif table_region["inserted"]:
+                    _record_placement(
+                        report,
+                        block,
+                        status="covered_by_image_fallback",
+                        reason="complex_table_region_rasterized",
+                    )
+                    continue
+            formula_region = next(
+                (
+                    item
+                    for item in formula_regions
+                    if _block_overlaps_region(block, item["region"])
+                ),
+                None,
+            )
+            if formula_region is not None:
+                if not formula_region["inserted"]:
+                    paragraph = _add_inline_image(
+                        document,
+                        formula_region["block"],
+                        page,
+                        margin_points=margin_points,
+                    )
+                    if paragraph is not None:
+                        formula_region["inserted"] = True
+                        report["formula_count"] += formula_region["formula_count"]
+                        report["formula_image_fallback_count"] += 1
+                        report["formula_region_fallback_count"] += 1
+                        _record_placement(
+                            report,
+                            block,
+                            status="image_fallback",
+                            reason="formula_region_rasterized",
+                        )
+                        if first_paragraph is None:
+                            first_paragraph = paragraph
+                        continue
+                elif formula_region["inserted"]:
+                    _record_placement(
+                        report,
+                        block,
+                        status="covered_by_image_fallback",
+                        reason="formula_region_rasterized",
+                    )
+                    continue
             if dense_vector_bbox is not None and block.kind == "vector":
                 if dense_vector_image is not None and not dense_vector_inserted:
                     image_block = IRBlock(

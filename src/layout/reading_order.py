@@ -431,10 +431,17 @@ def _annotate_line_metrics(
     annotated: list[PdfTextLine] = []
     previous: PdfTextLine | None = None
     tolerance = 6.0
+    body_right = _estimate_body_right(ordered)
     for line in ordered:
-        left_bound, right_bound = _line_column_bounds(
-            line, columns, page_width
-        )
+        if columns:
+            left_bound, right_bound = _line_column_bounds(
+                line, columns, page_width
+            )
+        else:
+            left_bound = body_left
+            right_bound = body_right or page_width
+            if right_bound <= left_bound:
+                left_bound, right_bound = 0.0, page_width
         align_tolerance = max(4.0, min(10.0, (right_bound - left_bound) * 0.04))
         near_left = line.x0 <= left_bound + align_tolerance
         near_right = line.x1 >= right_bound - align_tolerance
@@ -446,7 +453,13 @@ def _annotate_line_metrics(
             alignment = "right"
         else:
             column_center = (left_bound + right_bound) / 2.0
-            if abs(line.center_x - column_center) <= max(3.0, (right_bound - left_bound) * 0.05):
+            centered_short_line = (
+                line.width < (right_bound - left_bound) * 0.75
+                and abs(line.center_x - column_center)
+                <= max(3.0, (right_bound - left_bound) * 0.05)
+                and line.font_size >= 11.0
+            )
+            if centered_short_line:
                 alignment = "center"
             else:
                 alignment = "left"
@@ -477,13 +490,34 @@ def _annotate_line_metrics(
 def _estimate_body_left(lines: Iterable[PdfTextLine]) -> float:
     """用出现次数最多的行首位置估计正文左边距。"""
     values = [
-        round(line.x0, 1) for line in lines if not line.is_header_footer
+        round(line.x0, 1)
+        for line in lines
+        if not line.is_header_footer
+        and abs(float(line.rotation or 0.0)) < 1.0
     ]
     if not values:
         return 0.0
     counts = Counter(values)
     most_common = max(counts.values())
     return min(
+        value for value, count in counts.items() if count == most_common
+    )
+
+
+def _estimate_body_right(lines: Iterable[PdfTextLine]) -> float:
+    """用出现次数最多的行尾位置估计正文右边界。"""
+    values = [
+        round(line.x1, 1)
+        for line in lines
+        if not line.is_header_footer
+        and abs(float(line.rotation or 0.0)) < 1.0
+    ]
+    if not values:
+        return 0.0
+    counts = Counter(values)
+    most_common = max(counts.values())
+    # 同频时取最靠右的候选，避免短标题把正文区域估窄。
+    return max(
         value for value, count in counts.items() if count == most_common
     )
 

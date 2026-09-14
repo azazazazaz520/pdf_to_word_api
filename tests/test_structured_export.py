@@ -9,8 +9,8 @@ from tempfile import TemporaryDirectory
 from docx import Document
 from PIL import Image
 
-from src.export.structured import export_structured_docx
-from src.ir.model import IRBlock, IRDocument, IRPage
+from src.export.structured import _complex_table_regions, export_structured_docx
+from src.ir.model import IRBlock, IRDocument, IRPage, IRTextLine
 from src.layout.models import PdfTable, PdfTableCell
 
 
@@ -69,7 +69,178 @@ def _pdf_table() -> PdfTable:
     )
 
 
+def _complex_pdf_table() -> PdfTable:
+    return PdfTable(
+        bbox=(40.0, 70.0, 320.0, 120.0),
+        column_boundaries=(40.0, 180.0, 320.0),
+        row_boundaries=(70.0, 82.0, 120.0),
+        rows=(("A\nB\nC", "1\n2\n3"), ("D", "4")),
+        cells=(
+            PdfTableCell(
+                row_index=0,
+                column_index=0,
+                row_span=1,
+                column_span=1,
+                bbox=(40.0, 70.0, 180.0, 82.0),
+                text="A\nB\nC",
+                font_size=10.0,
+            ),
+            PdfTableCell(
+                row_index=0,
+                column_index=1,
+                row_span=1,
+                column_span=1,
+                bbox=(180.0, 70.0, 320.0, 82.0),
+                text="1\n2\n3",
+                font_size=10.0,
+            ),
+        ),
+    )
+
+
 class StructuredExportTest(unittest.TestCase):
+    def test_overfull_table_cells_are_marked_for_region_fallback(self) -> None:
+        page = IRPage(
+            page_number=1,
+            width=400.0,
+            height=300.0,
+            route="text",
+            blocks=[
+                IRBlock(
+                    kind="table",
+                    page=1,
+                    bbox=(40.0, 70.0, 320.0, 120.0),
+                    table=_complex_pdf_table(),
+                )
+            ],
+        )
+
+        self.assertEqual(
+            _complex_table_regions(page),
+            ((38.0, 68.0, 322.0, 122.0),),
+        )
+
+    def test_line_spacing_ratio_is_converted_to_points(self) -> None:
+        ir = IRDocument(
+            pages=[
+                IRPage(
+                    page_number=1,
+                    width=400.0,
+                    height=300.0,
+                    route="text",
+                    blocks=[
+                        IRBlock(
+                            kind="paragraph",
+                            page=1,
+                            text="第一行 第二行",
+                            font_size=10.0,
+                            line_spacing=1.1,
+                            lines=(
+                                IRTextLine(
+                                    text="第一行",
+                                    bbox=(40.0, 40.0, 80.0, 50.0),
+                                    font_size=10.0,
+                                ),
+                                IRTextLine(
+                                    text="第二行",
+                                    bbox=(40.0, 51.0, 80.0, 61.0),
+                                    font_size=10.0,
+                                ),
+                            ),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "line-spacing.docx"
+            export_structured_docx(ir, output_path)
+            with zipfile.ZipFile(output_path) as archive:
+                document_xml = archive.read("word/document.xml").decode("utf-8")
+
+        self.assertIn('w:line="220"', document_xml)
+        self.assertNotIn('w:line="22"', document_xml)
+
+    def test_rotated_text_is_page_anchored_instead_of_horizontal_flow_text(self) -> None:
+        ir = IRDocument(
+            pages=[
+                IRPage(
+                    page_number=1,
+                    width=400.0,
+                    height=300.0,
+                    route="text",
+                    blocks=[
+                        IRBlock(
+                            kind="paragraph",
+                            page=1,
+                            text="侧边元数据",
+                            bbox=(8.0, 80.0, 20.0, 180.0),
+                            rotation=-90.0,
+                            fallback_image=_image_bytes(),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "rotated-text.docx"
+            report = export_structured_docx(ir, output_path)
+            with zipfile.ZipFile(output_path) as archive:
+                document_xml = archive.read("word/document.xml").decode("utf-8")
+
+        self.assertEqual(report["rotated_text_image_fallback_count"], 1)
+        self.assertIn("<wp:anchor", document_xml)
+        self.assertNotIn("侧边元数据", document_xml)
+
+    def test_grid_like_text_is_degraded_locally_without_bullets(self) -> None:
+        lines = tuple(
+            IRTextLine(
+                text=text,
+                bbox=bbox,
+                font_size=10.0,
+            )
+            for text, bbox in (
+                ("甲", (40.0, 40.0, 60.0, 50.0)),
+                ("乙", (180.0, 40.0, 200.0, 50.0)),
+                ("丙", (40.0, 55.0, 60.0, 65.0)),
+                ("丁", (180.0, 55.0, 200.0, 65.0)),
+            )
+        )
+        ir = IRDocument(
+            pages=[
+                IRPage(
+                    page_number=1,
+                    width=400.0,
+                    height=300.0,
+                    route="text",
+                    blocks=[
+                        IRBlock(
+                            kind="bullet",
+                            page=1,
+                            text="甲乙丙丁",
+                            bbox=(40.0, 40.0, 200.0, 65.0),
+                            lines=lines,
+                            fallback_image=_image_bytes(),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "grid-text.docx"
+            report = export_structured_docx(ir, output_path)
+            document = Document(output_path)
+            with zipfile.ZipFile(output_path) as archive:
+                document_xml = archive.read("word/document.xml").decode("utf-8")
+
+        self.assertEqual(report["text_image_fallback_count"], 1)
+        self.assertEqual(len(document.paragraphs), 1)
+        self.assertNotIn("ListBullet", document_xml)
+        self.assertNotIn("甲乙丙丁", document_xml)
+
     def test_writes_flow_text_table_omml_and_inline_image(self) -> None:
         ir = IRDocument(
             title="结构化示例",

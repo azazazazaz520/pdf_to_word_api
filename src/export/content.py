@@ -23,7 +23,12 @@ _SECTION_HEADING = re.compile(
     r"^\s*(?:[一二三四五六七八九十百]+、|第\d+章|摘要(?:\s|$)|参考文献(?:\s|（|\(|$))"
 )
 _SUBSECTION_HEADING = re.compile(r"^\s*\d+\.\d+(?:\s|$)")
-_NUMERIC_SECTION_HEADING = re.compile(r"^\s*\d+\.(?!\d)\s+\S+")
+# Academic PDFs commonly render section numbers without a period
+# (``1 Introduction``) while other documents use ``1. Introduction``.
+# Keep the optional period conservative so decimal values do not become headings.
+_NUMERIC_SECTION_HEADING = re.compile(
+    r"^\s*\d+(?:\.(?!\d))?\s+\S+"
+)
 _LIST_ROLES = frozenset({"ordered", "bullet", "plugin"})
 _LINE_END_HYPHENS = frozenset(
     {"-", "\u00ad", "\u2010", "\u2011", "\u2012", "\u2013", "\u2014"}
@@ -63,6 +68,7 @@ def _typical_body_left(lines: Iterable[PdfTextLine]) -> float:
         round(line.x0, 1)
         for line in lines
         if not line.is_header_footer
+        and abs(float(line.rotation or 0.0)) < 1.0
     ]
     if not values:
         return 0.0
@@ -136,11 +142,6 @@ def _layout_lines_to_text(
     line_list = list(lines)
     font_sizes = sorted(line.font_size for line in line_list if line.font_size > 0)
     body_font_size = font_sizes[len(font_sizes) // 2] if font_sizes else 0.0
-    code_flags = [_looks_like_code_line(line.text) for line in line_list]
-    indented = [
-        line.x0 >= body_left + 22 and not code_flags[index]
-        for index, line in enumerate(line_list)
-    ]
     prepared: list[str] = []
     roles: list[str] = []
     previous_role: str | None = None
@@ -162,11 +163,12 @@ def _layout_lines_to_text(
             and not _is_sentence_terminal(line.text)
         ):
             role = previous_role
-        if role == "body" and indented[index]:
-            previous_indented = index > 0 and indented[index - 1]
-            next_indented = index + 1 < len(line_list) and indented[index + 1]
-            if previous_indented or next_indented:
-                role = "bullet"
+        if (
+            role == "body"
+            and previous_role == "formula"
+            and re.fullmatch(r"\(\s*\d+\s*\)", line.text.strip())
+        ):
+            role = "formula"
         if (
             role == "bullet"
             and previous_role == "ordered"
@@ -204,15 +206,21 @@ def _is_formula_line(line: str) -> bool:
         return False
     if _FORMULA_PREFIX.match(text) or _FORMULA_SYMBOL_PREFIX.match(text):
         return True
+    if len(text) > 90:
+        return False
     if not re.match(r"^\s*(?:[A-Za-zα-ωΑ-Ω]|\d)", text):
         return False
     if not re.search(r"[=≤≥≈]", text):
         return False
+    math_marks = len(re.findall(r"[=≤≥≈+\-−·*/^_()]", text))
+    required_marks = 1 if len(text) <= 20 else max(2, len(text) // 20)
+    if math_marks < required_marks:
+        return False
     if re.search(r"[∑∏∫√∞∂∇∀∃α-ωΑ-Ω₀-₉⁰-⁹]", text):
         return True
-    if re.search(r"[A-Za-zα-ωΑ-Ω]\s*[=≤≥≈]\s*[^=]+[+\-*/^]", text):
+    if re.search(r"[A-Za-zα-ωΑ-Ω]\s*[=≤≥≈]\s*[^=]+[+\-−·*/^]", text):
         return True
-    return bool(re.fullmatch(r"[\sA-Za-z0-9_+\-*/^().,=]+", text))
+    return bool(re.fullmatch(r"[\sA-Za-z0-9_+\-−·*/^().,=]+", text))
 
 
 def _text_line_role(

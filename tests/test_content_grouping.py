@@ -13,11 +13,28 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
 from src.layout.layout import extract_pdf_layout
-from src.export.content import _group_text_lines
+from src.layout.models import PdfTextLine
+from src.export.content import (
+    _group_text_lines,
+    _is_formula_line,
+    _layout_lines_to_text,
+)
 from src.export.document_setup import _set_document_styles
 
 
 class HybridExportTest(unittest.TestCase):
+    def test_numeric_heading_without_period_is_kept_separate(self) -> None:
+        blocks = _group_text_lines(
+            "1 Introduction\n正文内容。",
+            is_document_start=False,
+            recognize_numeric_headings=True,
+        )
+
+        self.assertEqual(
+            blocks,
+            [("heading1", "1 Introduction"), ("body", "正文内容。")],
+        )
+
     def test_text_grouping_joins_wrapped_lines_without_extra_spaces(self) -> None:
         blocks = _group_text_lines(
             "标题\n第一行内容\n第二行内容。\n1. 第一项\n续行。",
@@ -61,6 +78,58 @@ class HybridExportTest(unittest.TestCase):
         self.assertEqual(
             blocks,
             [("body", "目标函数："), ("formula", "∑ᵢ xᵢ = 1")],
+        )
+
+    def test_inline_math_in_prose_stays_in_body_text(self) -> None:
+        blocks = _group_text_lines(
+            "The dimensionality of input and output is dmodel = 512, "
+            "and the inner-layer has dimensionality"
+        )
+
+        self.assertEqual(
+            blocks,
+            [
+                (
+                    "body",
+                    "The dimensionality of input and output is dmodel = 512, "
+                    "and the inner-layer has dimensionality",
+                )
+            ],
+        )
+
+    def test_unicode_math_formula_is_split_from_following_prose(self) -> None:
+        formula = (
+            "lrate = dm−o0d.e5l · min(step_num−0.5, "
+            "step_num · warmup_steps−1.5)"
+        )
+        self.assertTrue(_is_formula_line(formula))
+        lines = tuple(
+            PdfTextLine(
+                text=text,
+                x0=72.0,
+                top=index * 12.0,
+                x1=300.0,
+                bottom=index * 12.0 + 9.0,
+                font_size=10.0,
+            )
+            for index, text in enumerate(
+                (formula, "(3)", "This corresponds to the next step.")
+            )
+        )
+        content, roles = _layout_lines_to_text(
+            lines,
+            body_left=72.0,
+            is_document_start=False,
+        )
+        blocks = _group_text_lines(content, line_roles=roles)
+
+        self.assertEqual(
+            blocks,
+            [
+                ("formula", formula),
+                ("formula", "(3)"),
+                ("body", "This corresponds to the next step."),
+            ],
         )
 
 if __name__ == "__main__":
