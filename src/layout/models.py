@@ -43,6 +43,55 @@ _MIN_BOUNDARY_COVERAGE = 0.6
 
 
 @dataclass(frozen=True)
+class PdfTextGlyph:
+    """一个可定位的 PDF 字符。
+
+    ``bbox`` 使用页面左上角为原点的坐标，``direction`` 同样使用页面坐标
+    （x 向右、y 向下）。字符级数据是行、段落和版面块聚合时的唯一几何来源。
+    """
+
+    text: str
+    bbox: tuple[float, float, float, float]
+    font_name: str = ""
+    pdf_font_name: str = ""
+    font_size: float = 0.0
+    color: tuple[int, int, int] = (0, 0, 0)
+    bold: bool = False
+    italic: bool = False
+    rotation: float = 0.0
+    direction: tuple[float, float] = (1.0, 0.0)
+    z_order: int = 0
+    char_index: int = -1
+    object_index: int = -1
+    substituted: bool = False
+    fallback_reason: str = ""
+
+    @property
+    def x0(self) -> float:
+        return self.bbox[0]
+
+    @property
+    def top(self) -> float:
+        return self.bbox[1]
+
+    @property
+    def x1(self) -> float:
+        return self.bbox[2]
+
+    @property
+    def bottom(self) -> float:
+        return self.bbox[3]
+
+    @property
+    def width(self) -> float:
+        return max(self.x1 - self.x0, 0.0)
+
+    @property
+    def height(self) -> float:
+        return max(self.bottom - self.top, 0.0)
+
+
+@dataclass(frozen=True)
 class PdfTextSpan:
     """同一行内具有相同字体/字号/颜色的连续文本片段。"""
 
@@ -58,6 +107,8 @@ class PdfTextSpan:
     z_order: int = 0
     substituted: bool = False
     fallback_reason: str = ""
+    direction: tuple[float, float] = (1.0, 0.0)
+    glyphs: tuple[PdfTextGlyph, ...] = ()
 
     @property
     def x0(self) -> float:
@@ -80,8 +131,8 @@ class PdfTextSpan:
 class PdfTextLine:
     """保存可用于阅读顺序和列表识别的 PDF 文本行。
 
-    高保真字段（字体、颜色、对齐、行距、z-order）默认值保持向后兼容，
-    只有 ``include_fidelity=True`` 时才会被填充。
+    字符级字形、方向和基础字体信息始终保留；对齐、行距和 z-order 等
+    高保真字段由版面提取阶段补充。
     """
 
     text: str
@@ -106,6 +157,8 @@ class PdfTextLine:
     pdf_font_name: str = ""
     font_substituted: bool = False
     font_fallback_reason: str = ""
+    direction: tuple[float, float] = (1.0, 0.0)
+    glyphs: tuple[PdfTextGlyph, ...] = ()
 
     @property
     def center_x(self) -> float:
@@ -122,6 +175,38 @@ class PdfTextLine:
     @property
     def height(self) -> float:
         return max(self.bottom - self.top, 0.0)
+
+
+@dataclass(frozen=True)
+class PdfTextBlock:
+    """由几何相邻文本行组成的版面文本块。"""
+
+    lines: tuple[PdfTextLine, ...]
+    bbox: tuple[float, float, float, float]
+    column_index: int = -1
+    direction: tuple[float, float] = (1.0, 0.0)
+    rotation: float = 0.0
+    is_header_footer: bool = False
+
+    @property
+    def text(self) -> str:
+        return "\n".join(line.text for line in self.lines)
+
+    @property
+    def x0(self) -> float:
+        return self.bbox[0]
+
+    @property
+    def top(self) -> float:
+        return self.bbox[1]
+
+    @property
+    def x1(self) -> float:
+        return self.bbox[2]
+
+    @property
+    def bottom(self) -> float:
+        return self.bbox[3]
 
 
 @dataclass(frozen=True)
@@ -221,7 +306,7 @@ class PdfTable:
 
 @dataclass(frozen=True)
 class PdfPageLayout:
-    """保存单页的尺寸、文本行、几何表格和矢量对象。"""
+    """保存单页的尺寸、文本行、几何文本块、表格和矢量对象。"""
 
     width: float
     height: float
@@ -231,6 +316,7 @@ class PdfPageLayout:
     columns: tuple[float, ...] = ()
     vectors: tuple[PdfVectorObject, ...] = ()
     has_page_background: bool = False
+    text_blocks: tuple[PdfTextBlock, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -292,6 +378,9 @@ class _TextCharacter:
     pdf_font_name: str = ""
     font_substituted: bool = False
     font_fallback_reason: str = ""
+    direction: tuple[float, float] = (1.0, 0.0)
+    char_index: int = -1
+    object_index: int = -1
 
     @property
     def center_x(self) -> float:
@@ -317,6 +406,8 @@ class _TextObjectStyle:
     pdf_font_name: str = ""
     substituted: bool = False
     fallback_reason: str = ""
+    object_key: int = 0
+    object_index: int = -1
 
     @property
     def area(self) -> float:

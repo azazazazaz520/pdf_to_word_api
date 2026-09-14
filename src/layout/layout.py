@@ -21,6 +21,7 @@ from .models import (
     _PAGEOBJ_TEXT,
 )
 from .reading_order import (
+    _build_text_blocks,
     _annotate_line_metrics,
     _mark_logos,
     _mark_running_headers,
@@ -72,16 +73,13 @@ def extract_pdf_layout(
             width, height = (float(value) for value in page.get_size())
             text_page = page.get_textpage()
             try:
-                styles = (
-                    _extract_object_styles(
-                        page,
-                        text_page,
-                        height,
-                        font_descriptors=font_descriptors,
-                        font_cache=font_cache,
-                    )
-                    if include_fidelity
-                    else None
+                styles = _extract_object_styles(
+                    page,
+                    text_page,
+                    height,
+                    font_descriptors=font_descriptors,
+                    font_cache=font_cache,
+                    resolve_fonts=include_fidelity,
                 )
                 lines = _extract_text_lines(
                     text_page,
@@ -179,6 +177,17 @@ def extract_pdf_layout(
     )
     if include_fidelity:
         updated_pages = _mark_logos(updated_pages)
+    updated_pages = tuple(
+        replace(
+            page,
+            text_blocks=_build_text_blocks(
+                page.lines,
+                boundaries=page.columns,
+                page_width=page.width,
+            ),
+        )
+        for page in updated_pages
+    )
     return PdfDocumentLayout(pages=_mark_table_continuations(updated_pages))
 
 

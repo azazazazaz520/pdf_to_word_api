@@ -1,12 +1,13 @@
 """文本字符、字体样式与文本行的提取。
 
-从页面图形对象读出字符盒、字体、字号、颜色与旋转，按基线聚成行，
+从页面图形对象读出字符盒、字体、字号、颜色与方向，按方向投影聚成行，
 再按字体 run 切成 span。
 """
 
 from __future__ import annotations
 from typing import Any
 from .models import (
+    PdfTextGlyph,
     PdfTextLine,
     PdfTextSpan,
     _TextCharacter,
@@ -15,11 +16,21 @@ from .models import (
     _dominant_value,
 )
 import math
+import ctypes
 from bisect import bisect_left
 from ctypes import c_float, c_int, c_uint
 import pypdfium2.raw as pdfium_raw
 from ..fonts.resolver import FontMatch, PdfFontDescriptor, resolve_font
 from .models import _PAGEOBJ_TEXT
+
+
+def _raw_pointer_value(value: Any) -> int:
+    """返回 PDFium 对象句柄的稳定整数键。"""
+    raw = getattr(value, "raw", value)
+    try:
+        return int(ctypes.cast(raw, ctypes.c_void_p).value or 0)
+    except Exception:
+        return 0
 
 def _raw_color(
     getter: Any,
@@ -138,6 +149,7 @@ def _extract_object_styles(
     *,
     font_descriptors: dict[str, PdfFontDescriptor] | None = None,
     font_cache: dict[tuple[Any, ...], FontMatch] | None = None,
+    resolve_fonts: bool = True,
 ) -> list[_TextObjectStyle]:
     """提取页面中所有文本对象的字体、颜色和 z-order。"""
     styles: list[_TextObjectStyle] = []
@@ -147,6 +159,7 @@ def _extract_object_styles(
     except Exception:
         return styles
     for index, page_object in enumerate(objects):
+        object_key = _raw_pointer_value(page_object)
         try:
             if page_object.type != _PAGEOBJ_TEXT:
                 continue
@@ -168,6 +181,7 @@ def _extract_object_styles(
             flags: int | None = None
             italic_angle: float | None = None
             sample_text = ""
+            font = None
             try:
                 font = page_object.get_font()
                 try:
@@ -198,16 +212,28 @@ def _extract_object_styles(
                     sample_text = ""
             except Exception:
                 pass
-            match = _resolve_object_font(
-                base_name=base_name,
-                family_hint=family_hint,
-                weight=weight,
-                flags=flags,
-                italic_angle=italic_angle,
-                descriptors=font_descriptors,
-                cache=cache,
-                sample_text=sample_text,
-            )
+            if resolve_fonts:
+                match = _resolve_object_font(
+                    base_name=base_name,
+                    family_hint=family_hint,
+                    weight=weight,
+                    flags=flags,
+                    italic_angle=italic_angle,
+                    descriptors=font_descriptors,
+                    cache=cache,
+                    sample_text=sample_text,
+                )
+                font_name = match.family or family_hint or base_name or ""
+                bold = match.bold
+                italic = match.italic
+                substituted = match.substituted
+                fallback_reason = match.fallback_reason
+            else:
+                font_name = family_hint or base_name or ""
+                bold = _font_is_bold(font, weight or 0, base_name, family_hint)
+                italic = _font_is_italic(font, base_name, family_hint)
+                substituted = False
+                fallback_reason = ""
             rotation = 0.0
             matrix_scale = 1.0
             try:
@@ -226,16 +252,18 @@ def _extract_object_styles(
             styles.append(
                 _TextObjectStyle(
                     bbox=bbox,
-                    font_name=match.family or family_hint or base_name or "",
+                    font_name=font_name,
                     font_size=max(font_size, 0.1),
                     color=color,
-                    bold=match.bold,
-                    italic=match.italic,
+                    bold=bold,
+                    italic=italic,
                     z_order=index,
                     rotation=rotation,
                     pdf_font_name=base_name or family_hint,
-                    substituted=match.substituted,
-                    fallback_reason=match.fallback_reason,
+                    substituted=substituted,
+                    fallback_reason=fallback_reason,
+                    object_key=object_key,
+                    object_index=index,
                 )
             )
         finally:
@@ -275,9 +303,7 @@ def _matrix_rotation(matrix: Any) -> float:
     if abs(a) < 1e-6 and abs(b) < 1e-6:
         return 0.0
     angle = math.degrees(math.atan2(b, a))
-    if abs(angle) < 0.05 or abs(abs(angle) - 180.0) < 0.05:
-        return 0.0
-    return round(angle, 2)
+    return _normalize_rotation(angle)
 
 
 def _style_index(
@@ -343,6 +369,118 @@ def _is_xml_control_character(value: str) -> bool:
     return code < 0x20 and code not in {0x09, 0x0A, 0x0D}
 
 
+def _raw_character_text(text_page: Any, index: int) -> str:
+    """按 PDFium 内部字符索引读取一个 Unicode 字符。
+
+    ``get_text_range`` 是面向文本缓冲区的接口，可能过滤或插入字符；
+    ``get_charbox`` 使用的却是内部字符数组，所以两者不能用同一个枚举
+    下标直接配对。
+    """
+    getter = getattr(pdfium_raw, "FPDFText_GetUnicode", None)
+    if getter is not None:
+        try:
+            codepoint = int(getter(text_page.raw, index))
+        except (ValueError, OverflowError, TypeError):
+            codepoint = None
+        except Exception:
+            codepoint = None
+        if codepoint is not None:
+            if (
+                codepoint < 0
+                or codepoint in {0, 0xFFFE}
+                or codepoint > 0x10FFFF
+            ):
+                return ""
+            return chr(codepoint)
+    sliced = True
+    try:
+        value = text_page.get_text_range(index, 1)
+    except Exception:
+        sliced = False
+        try:
+            value = text_page.get_text_range()
+        except Exception:
+            return ""
+    if not sliced:
+        value = value[index : index + 1]
+    return value[0] if value else ""
+
+
+def _normalize_rotation(value: float) -> float:
+    """把角度规范到 ``[-180, 180]``，单位为度。"""
+    if not math.isfinite(value):
+        return 0.0
+    angle = (float(value) + 180.0) % 360.0 - 180.0
+    if abs(angle + 180.0) <= 0.05:
+        angle = 180.0
+    if abs(angle) <= 0.05:
+        angle = 0.0
+    return round(angle, 2)
+
+
+def _raw_character_rotation(text_page: Any, index: int) -> float | None:
+    """读取 PDFium 字符方向，并将其从弧度转换为度。"""
+    getter = getattr(pdfium_raw, "FPDFText_GetCharAngle", None)
+    if getter is None:
+        return None
+    try:
+        value = float(getter(text_page.raw, index))
+    except Exception:
+        return None
+    # PDFium 返回弧度；保留对少数兼容实现返回角度值的兼容性。
+    degrees = math.degrees(value) if abs(value) <= (2.0 * math.pi + 0.1) else value
+    return _normalize_rotation(degrees)
+
+
+def _raw_character_font_size(text_page: Any, index: int) -> float:
+    """读取字符实际绘制字号。"""
+    getter = getattr(pdfium_raw, "FPDFText_GetFontSize", None)
+    if getter is None:
+        return 0.0
+    try:
+        value = float(getter(text_page.raw, index))
+    except Exception:
+        return 0.0
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def _direction_from_rotation(rotation: float) -> tuple[float, float]:
+    """返回左上角页面坐标中的阅读方向单位向量。"""
+    radians = math.radians(rotation)
+    return (round(math.cos(radians), 6), round(math.sin(radians), 6))
+
+
+def _styles_by_object(
+    styles: list[_TextObjectStyle] | None,
+) -> dict[int, _TextObjectStyle]:
+    if not styles:
+        return {}
+    return {
+        style.object_key: style
+        for style in styles
+        if style.object_key
+    }
+
+
+def _style_for_character(
+    text_page: Any,
+    character: _TextCharacter,
+    styles: list[_TextObjectStyle],
+    styles_by_object: dict[int, _TextObjectStyle],
+    style_index: dict[tuple[int, int], list[int]],
+) -> _TextObjectStyle | None:
+    """优先按 PDFium 文本对象句柄取样式，空间匹配只作兼容回退。"""
+    try:
+        text_object = text_page.get_textobj(character.char_index)
+    except Exception:
+        text_object = None
+    if text_object is not None:
+        style = styles_by_object.get(_raw_pointer_value(text_object))
+        if style is not None:
+            return style
+    return _match_style(character, styles, style_index)
+
+
 def _extract_text_characters(
     text_page: Any,
     page_height: float,
@@ -351,43 +489,69 @@ def _extract_text_characters(
 ) -> list[_TextCharacter]:
     characters: list[_TextCharacter] = []
     style_index = _style_index(styles) if styles else {}
-    text = text_page.get_text_range()
-    for index, raw_text in enumerate(text):
-        if raw_text in {"", "\r", "\n", "\t", "\ufffe"} or _is_xml_control_character(
+    styles_by_object = _styles_by_object(styles)
+    try:
+        count = int(text_page.count_chars())
+    except Exception:
+        try:
+            count = len(text_page.get_text_range())
+        except Exception:
+            count = 0
+    for index in range(max(count, 0)):
+        raw_text = _raw_character_text(text_page, index)
+        if raw_text in {"", "\r", "\n", "\ufffe"} or _is_xml_control_character(
             raw_text
         ):
             continue
-        if raw_text == " ":
-            text = raw_text
-        else:
-            text = _compact_text(raw_text)
+        text = raw_text if raw_text.isspace() else _compact_text(raw_text)
         if not text:
             continue
-        x0, y0, x1, y1 = (float(value) for value in text_page.get_charbox(index))
-        height = max(abs(y1 - y0), 1.0)
+        try:
+            x0, y0, x1, y1 = (
+                float(value) for value in text_page.get_charbox(index)
+            )
+        except Exception:
+            continue
+        height = max(abs(y1 - y0), 0.1)
+        raw_rotation = _raw_character_rotation(text_page, index)
+        raw_font_size = _raw_character_font_size(text_page, index)
+        rotation = raw_rotation if raw_rotation is not None else 0.0
+        direction = _direction_from_rotation(rotation)
         character = _TextCharacter(
             text=text,
             x0=x0,
             top=page_height - max(y0, y1),
             x1=x1,
             bottom=page_height - min(y0, y1),
-            font_size=height,
+            font_size=raw_font_size or height,
+            rotation=rotation,
+            direction=direction,
+            char_index=index,
         )
         if styles:
-            style = _match_style(
-                character, styles, style_index
+            style = _style_for_character(
+                text_page,
+                character,
+                styles,
+                styles_by_object,
+                style_index,
             )
             if style is not None:
                 character.font_name = style.font_name
                 character.color = style.color
                 character.bold = style.bold
                 character.italic = style.italic
-                character.rotation = style.rotation
+                if raw_rotation is None:
+                    character.rotation = style.rotation
+                    character.direction = _direction_from_rotation(
+                        character.rotation
+                    )
                 character.z_order = style.z_order
+                character.object_index = style.object_index
                 character.pdf_font_name = style.pdf_font_name
                 character.font_substituted = style.substituted
                 character.font_fallback_reason = style.fallback_reason
-                if style.font_size > 0.2:
+                if raw_font_size <= 0.2 and style.font_size > 0.2:
                     character.font_size = style.font_size
         characters.append(character)
     return characters
@@ -438,6 +602,171 @@ def _group_into_rows(
     for row in rows:
         row.sort(key=lambda item: item.x0)
     return rows
+
+
+_ORIENTATION_TOLERANCE = 8.0
+
+
+def _angle_distance(left: float, right: float) -> float:
+    """返回两个有方向角之间的最小差值。"""
+    return abs((float(left) - float(right) + 180.0) % 360.0 - 180.0)
+
+
+def _mean_rotation(characters: list[_TextCharacter]) -> float:
+    """用字符方向向量求一组字符的代表角度。"""
+    if not characters:
+        return 0.0
+    x_total = 0.0
+    y_total = 0.0
+    for character in characters:
+        dx, dy = character.direction
+        x_total += dx
+        y_total += dy
+    if abs(x_total) <= 1e-6 and abs(y_total) <= 1e-6:
+        return _normalize_rotation(float(characters[0].rotation))
+    return _normalize_rotation(math.degrees(math.atan2(y_total, x_total)))
+
+
+def _projection(
+    character: _TextCharacter,
+    axis: tuple[float, float],
+) -> float:
+    return character.center_x * axis[0] + character.center_y * axis[1]
+
+
+def _projected_extent(
+    character: _TextCharacter,
+    axis: tuple[float, float],
+) -> tuple[float, float]:
+    points = (
+        (character.x0, character.top),
+        (character.x0, character.bottom),
+        (character.x1, character.top),
+        (character.x1, character.bottom),
+    )
+    values = [point[0] * axis[0] + point[1] * axis[1] for point in points]
+    return min(values), max(values)
+
+
+def _orientation_groups(
+    characters: list[_TextCharacter],
+) -> list[tuple[float, list[_TextCharacter]]]:
+    """按有方向角拆分字符，避免把竖排文字放进横排文字行。"""
+    groups: list[tuple[float, list[_TextCharacter]]] = []
+    for character in sorted(
+        characters,
+        key=lambda item: (item.char_index if item.char_index >= 0 else 0),
+    ):
+        best_index = None
+        best_distance = None
+        for index, (rotation, group) in enumerate(groups):
+            distance = _angle_distance(character.rotation, rotation)
+            if distance <= _ORIENTATION_TOLERANCE and (
+                best_distance is None or distance < best_distance
+            ):
+                best_index = index
+                best_distance = distance
+        if best_index is None:
+            groups.append((character.rotation, [character]))
+            continue
+        rotation, group = groups[best_index]
+        group.append(character)
+        groups[best_index] = (_mean_rotation(group), group)
+    return groups
+
+
+def _split_geometry_row(
+    characters: list[_TextCharacter],
+    rotation: float,
+) -> list[list[_TextCharacter]]:
+    """按阅读方向投影，把同一视觉行中的大间隔拆为独立文字段。"""
+    direction = _direction_from_rotation(rotation)
+    ordered = sorted(
+        characters,
+        key=lambda item: (
+            _projection(item, direction),
+            item.char_index if item.char_index >= 0 else 0,
+        ),
+    )
+    sizes = [
+        float(item.font_size)
+        for item in ordered
+        if float(item.font_size) > 0.2
+    ]
+    line_size = sizes[len(sizes) // 2] if sizes else 8.0
+    split_gap = max(line_size * 1.6, 8.0)
+    runs: list[list[_TextCharacter]] = []
+    current: list[_TextCharacter] = []
+    previous_end = None
+    for character in ordered:
+        start, end = _projected_extent(character, direction)
+        if current and previous_end is not None and start - previous_end > split_gap:
+            runs.append(current)
+            current = []
+        current.append(character)
+        previous_end = end if previous_end is None else max(previous_end, end)
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _geometry_character_groups(
+    characters: list[_TextCharacter],
+) -> list[tuple[float, list[_TextCharacter]]]:
+    """依据字符中心投影聚合成方向一致的视觉行。"""
+    result: list[tuple[float, list[_TextCharacter]]] = []
+    for orientation, oriented in _orientation_groups(characters):
+        direction = _direction_from_rotation(orientation)
+        normal = (-direction[1], direction[0])
+        entries = sorted(
+            (
+                _projection(character, normal),
+                character.char_index if character.char_index >= 0 else 0,
+                character,
+            )
+            for character in oriented
+        )
+        rows: list[list[_TextCharacter]] = []
+        row_centers: list[float] = []
+        row_sizes: list[float] = []
+        for normal_value, _, character in entries:
+            size = max(
+                float(character.font_size or 0.0),
+                abs(character.x1 - character.x0),
+                abs(character.bottom - character.top),
+                1.0,
+            )
+            best_index = None
+            best_distance = None
+            for index, row_center in enumerate(row_centers):
+                tolerance = max(
+                    1.5,
+                    0.55 * max(size, row_sizes[index]),
+                )
+                distance = abs(normal_value - row_center)
+                if distance <= tolerance and (
+                    best_distance is None or distance < best_distance
+                ):
+                    best_index = index
+                    best_distance = distance
+            if best_index is None:
+                rows.append([character])
+                row_centers.append(normal_value)
+                row_sizes.append(size)
+            else:
+                rows[best_index].append(character)
+                row_centers[best_index] = sum(
+                    _projection(item, normal) for item in rows[best_index]
+                ) / len(rows[best_index])
+                row_sizes[best_index] = max(
+                    row_sizes[best_index], size
+                )
+        for row in rows:
+            row_rotation = _mean_rotation(row)
+            for run in _split_geometry_row(row, row_rotation):
+                if run:
+                    result.append((row_rotation, run))
+    return result
 
 
 def _merge_fragmented_groups(
@@ -505,65 +834,114 @@ def _group_extent(group: list[_TextCharacter]) -> tuple[float, float]:
     )
 
 
-def _split_text_band(characters: list[_TextCharacter]) -> list[PdfTextLine]:
-    rows = _group_into_rows(characters)
-    characters = [item for row in rows for item in row]
-    runs: list[list[_TextCharacter]] = []
-    current: list[_TextCharacter] = []
-    for character in characters:
-        if current:
-            previous = current[-1]
-            gap = character.x0 - previous.x1
-            # 词间空格约半个字宽，超过一个字宽即认为是并列的独立文本
-            # （同一视觉行内的多个姓名、页脚的不同栏目），拆成两行
-            split_gap = max(previous.font_size, character.font_size) * 1.0
-            if gap > split_gap:
-                runs.append(current)
-                current = []
-        current.append(character)
-    if current:
-        runs.append(current)
+def _ordered_characters(
+    characters: list[_TextCharacter],
+    rotation: float | None = None,
+) -> list[_TextCharacter]:
+    line_rotation = _mean_rotation(characters) if rotation is None else rotation
+    object_indices = {
+        item.object_index
+        for item in characters
+        if item.object_index >= 0
+    }
+    if len(object_indices) == 1 and all(item.char_index >= 0 for item in characters):
+        # 一个 PDF 文本对象本身已经携带了可靠的字符流顺序，尤其适用于
+        # 竖排或任意角度文字；多个对象组成的同行再使用几何投影排序。
+        return sorted(characters, key=lambda item: item.char_index)
+    direction = _direction_from_rotation(line_rotation)
+    return sorted(
+        characters,
+        key=lambda item: (
+            _projection(item, direction),
+            item.char_index if item.char_index >= 0 else 0,
+        ),
+    )
 
-    lines: list[PdfTextLine] = []
-    for run in runs:
-        text = _compact_text("".join(item.text for item in run))
-        if not text:
-            continue
-        font_sizes = sorted(item.font_size for item in run if item.font_size > 0)
-        font_names = [item.font_name for item in run if item.font_name]
-        colors = [item.color for item in run]
-        rotations = [item.rotation for item in run if abs(item.rotation) > 0.05]
-        spans = _build_text_spans(run)
-        dominant_span = max(
-            spans, key=lambda item: len(item.text), default=None
-        )
-        lines.append(
-            PdfTextLine(
-                text=text,
-                x0=min(item.x0 for item in run),
-                top=min(item.top for item in run),
-                x1=max(item.x1 for item in run),
-                bottom=max(item.bottom for item in run),
-                font_size=font_sizes[len(font_sizes) // 2] if font_sizes else 0.0,
-                font_name=_dominant_value(font_names, ""),
-                color=_dominant_value(colors, (0, 0, 0)),
-                bold=sum(item.bold for item in run) * 2 >= len(run),
-                italic=sum(item.italic for item in run) * 2 >= len(run),
-                rotation=_dominant_value(rotations, 0.0),
-                z_order=min(item.z_order for item in run),
-                spans=spans,
-                pdf_font_name=(
-                    dominant_span.pdf_font_name if dominant_span else ""
-                ),
-                font_substituted=any(
-                    item.font_substituted for item in run
-                ),
-                font_fallback_reason=(
-                    dominant_span.fallback_reason if dominant_span else ""
-                ),
-            )
-        )
-    return lines
+
+def _glyph_from_character(character: _TextCharacter) -> PdfTextGlyph:
+    return PdfTextGlyph(
+        text=character.text,
+        bbox=(
+            min(character.x0, character.x1),
+            min(character.top, character.bottom),
+            max(character.x0, character.x1),
+            max(character.top, character.bottom),
+        ),
+        font_name=character.font_name,
+        pdf_font_name=character.pdf_font_name,
+        font_size=character.font_size,
+        color=character.color,
+        bold=character.bold,
+        italic=character.italic,
+        rotation=character.rotation,
+        direction=character.direction,
+        z_order=character.z_order,
+        char_index=character.char_index,
+        object_index=character.object_index,
+        substituted=character.font_substituted,
+        fallback_reason=character.font_fallback_reason,
+    )
+
+
+def _build_text_line(
+    characters: list[_TextCharacter],
+    *,
+    rotation: float | None = None,
+) -> PdfTextLine | None:
+    if not characters:
+        return None
+    line_rotation = _mean_rotation(characters) if rotation is None else rotation
+    ordered = _ordered_characters(characters, line_rotation)
+    text = _compact_text("".join(item.text for item in ordered))
+    if not text:
+        return None
+    font_sizes = sorted(
+        item.font_size for item in ordered if item.font_size > 0
+    )
+    font_names = [item.font_name for item in ordered if item.font_name]
+    colors = [item.color for item in ordered]
+    spans = _build_text_spans(ordered, rotation=line_rotation)
+    dominant_span = max(spans, key=lambda item: len(item.text), default=None)
+    glyphs = tuple(_glyph_from_character(item) for item in ordered)
+    return PdfTextLine(
+        text=text,
+        x0=min(item.x0 for item in ordered),
+        top=min(item.top for item in ordered),
+        x1=max(item.x1 for item in ordered),
+        bottom=max(item.bottom for item in ordered),
+        font_size=font_sizes[len(font_sizes) // 2] if font_sizes else 0.0,
+        font_name=_dominant_value(font_names, ""),
+        color=_dominant_value(colors, (0, 0, 0)),
+        bold=sum(item.bold for item in ordered) * 2 >= len(ordered),
+        italic=sum(item.italic for item in ordered) * 2 >= len(ordered),
+        rotation=line_rotation,
+        direction=_direction_from_rotation(line_rotation),
+        z_order=min(item.z_order for item in ordered),
+        spans=spans,
+        pdf_font_name=dominant_span.pdf_font_name if dominant_span else "",
+        font_substituted=any(item.font_substituted for item in ordered),
+        font_fallback_reason=(
+            dominant_span.fallback_reason if dominant_span else ""
+        ),
+        glyphs=glyphs,
+    )
+
+
+def _split_text_band(
+    characters: list[_TextCharacter],
+    *,
+    rotation: float | None = None,
+) -> list[PdfTextLine]:
+    """把字符组装成一条或多条方向一致的文本行。"""
+    if rotation is not None:
+        line = _build_text_line(characters, rotation=rotation)
+        return [line] if line is not None else []
+    result: list[PdfTextLine] = []
+    for row_rotation, row in _geometry_character_groups(characters):
+        line = _build_text_line(row, rotation=row_rotation)
+        if line is not None:
+            result.append(line)
+    return result
 
 
 def _is_degenerate_height(character: _TextCharacter) -> bool:
@@ -602,9 +980,13 @@ def _same_font_run(
     first = group[0]
     if character.font_name != first.font_name:
         return False
+    if character.pdf_font_name != first.pdf_font_name:
+        return False
     if bool(character.bold) != bool(first.bold):
         return False
     if bool(character.italic) != bool(first.italic):
+        return False
+    if character.color != first.color:
         return False
     if abs(float(character.rotation) - float(first.rotation)) >= 2.0:
         return False
@@ -619,11 +1001,13 @@ def _same_font_run(
 
 def _build_text_spans(
     characters: list[_TextCharacter],
+    *,
+    rotation: float | None = None,
 ) -> tuple[PdfTextSpan, ...]:
     """把一行字符按字体与其他排版变化切成连续的 span。"""
     if not characters:
         return ()
-    ordered = sorted(characters, key=lambda item: item.x0)
+    ordered = _ordered_characters(characters, rotation=rotation)
     sizes = sorted(
         float(item.font_size) for item in ordered if float(item.font_size) > 0
     )
@@ -670,9 +1054,11 @@ def _build_text_spans(
                 bold=representative.bold,
                 italic=representative.italic,
                 rotation=representative.rotation,
+                direction=representative.direction,
                 z_order=min(item.z_order for item in group),
                 substituted=representative.font_substituted,
                 fallback_reason=representative.font_fallback_reason,
+                glyphs=tuple(_glyph_from_character(item) for item in group),
             )
         )
     return tuple(spans)
@@ -822,6 +1208,8 @@ def _same_line_row(left: PdfTextLine, right: PdfTextLine) -> bool:
     （基线）基本重合。上界或基线落在行高的一小段以内即视为同一行；
     正文行的行距远大于该容差，不会被并入。
     """
+    if _angle_distance(left.rotation, right.rotation) > _ORIENTATION_TOLERANCE:
+        return False
     scale = max(
         float(left.font_size or 0.0),
         left.bottom - left.top,
@@ -847,24 +1235,9 @@ def _extract_text_lines(
         page_height,
         styles=styles,
     )
-    rectangles = _line_rectangles(text_page, page_height)
-    groups = _assign_characters_to_rectangles(characters, rectangles)
-    if not any(groups):
-        groups = [characters]
-    else:
-        assigned = sum(len(group) for group in groups)
-        if assigned < len(characters):
-            # 未被任何行矩形覆盖的字符仍按自身外框重建，避免静默丢字
-            covered = {id(item) for group in groups for item in group}
-            groups.append(
-                [item for item in characters if id(item) not in covered]
-            )
-    groups = _merge_fragmented_groups(groups, rectangles)
     lines: list[PdfTextLine] = []
-    for group in groups:
-        if not group:
-            continue
-        lines.extend(_split_text_band(group))
+    for rotation, group in _geometry_character_groups(characters):
+        lines.extend(_split_text_band(group, rotation=rotation))
     return _lines_in_reading_order(lines)
 
 

@@ -4,18 +4,38 @@
 """
 
 from __future__ import annotations
+
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterable
-from typing import Any
-from .models import PdfTextLine, _MIN_TABLE_WIDTH
-from .tables import _line_in_table
-import re
-from bisect import bisect_right
 from dataclasses import replace
-from .models import PdfImageBlock, PdfPageLayout, PdfTable, PdfVectorObject
+import math
+import re
+from typing import Any
+
+from .models import (
+    PdfImageBlock,
+    PdfPageLayout,
+    PdfTable,
+    PdfTextBlock,
+    PdfTextLine,
+    PdfVectorObject,
+    _MIN_TABLE_WIDTH,
+)
+from .tables import _line_in_table
+
 
 def _is_page_number_text(value: str) -> bool:
     return bool(re.fullmatch(r"\s*(?:第\s*)?\d{1,4}\s*(?:页)?\s*", value))
+
+
+def _same_text_direction(left: PdfTextLine, right: PdfTextLine) -> bool:
+    """旋转方向不同的文本不参与同一视觉行归并。"""
+    delta = abs(
+        (float(left.rotation) - float(right.rotation) + 180.0) % 360.0
+        - 180.0
+    )
+    return delta <= 8.0
 
 
 def _running_text_key(value: str) -> str:
@@ -124,6 +144,8 @@ def _same_visual_row(left: PdfTextLine, right: PdfTextLine) -> bool:
     成品因此出现姓名互换这类顺序错乱。上界或基线落在行高的一小段以内
     即视为同一行，正文行的行距远大于该容差，不会被并入。
     """
+    if not _same_text_direction(left, right):
+        return False
     scale = max(
         float(left.font_size or 0.0),
         left.bottom - left.top,
@@ -228,6 +250,157 @@ def _sort_lines_in_reading_order(
             )
         )
     return tuple(result)
+
+
+def _line_column_index(
+    line: PdfTextLine,
+    boundaries: tuple[float, ...],
+    page_width: float,
+) -> int:
+    if not boundaries:
+        return 0
+    if line.width >= page_width * 0.65 or any(
+        line.x0 < boundary < line.x1 for boundary in boundaries
+    ):
+        return -1
+    return bisect_right(boundaries, line.center_x)
+
+
+def _text_block_from_lines(
+    lines: list[PdfTextLine],
+    column_index: int,
+) -> PdfTextBlock:
+    return PdfTextBlock(
+        lines=tuple(lines),
+        bbox=(
+            min(line.x0 for line in lines),
+            min(line.top for line in lines),
+            max(line.x1 for line in lines),
+            max(line.bottom for line in lines),
+        ),
+        column_index=column_index,
+        direction=(
+            _dominant_direction(lines)
+            if lines
+            else (1.0, 0.0)
+        ),
+        rotation=_dominant_rotation(lines),
+        is_header_footer=all(line.is_header_footer for line in lines),
+    )
+
+
+def _dominant_rotation(lines: list[PdfTextLine]) -> float:
+    if not lines:
+        return 0.0
+    weights = [max(float(line.font_size), 1.0) for line in lines]
+    x_total = sum(
+        math.cos(math.radians(line.rotation)) * weight
+        for line, weight in zip(lines, weights)
+    )
+    y_total = sum(
+        math.sin(math.radians(line.rotation)) * weight
+        for line, weight in zip(lines, weights)
+    )
+    if abs(x_total) <= 1e-6 and abs(y_total) <= 1e-6:
+        return float(lines[0].rotation)
+    angle = math.degrees(math.atan2(y_total, x_total))
+    angle = (angle + 180.0) % 360.0 - 180.0
+    if abs(angle + 180.0) <= 0.05:
+        angle = 180.0
+    if abs(angle) <= 0.05:
+        angle = 0.0
+    return round(angle, 2)
+
+
+def _dominant_direction(lines: list[PdfTextLine]) -> tuple[float, float]:
+    rotation = _dominant_rotation(lines)
+    return _rotation_direction(rotation)
+
+
+def _rotation_direction(rotation: float) -> tuple[float, float]:
+    return (
+        round(math.cos(math.radians(rotation)), 6),
+        round(math.sin(math.radians(rotation)), 6),
+    )
+
+
+def _line_projection_interval(
+    line: PdfTextLine,
+    axis: tuple[float, float],
+) -> tuple[float, float]:
+    points = (
+        (line.x0, line.top),
+        (line.x0, line.bottom),
+        (line.x1, line.top),
+        (line.x1, line.bottom),
+    )
+    values = [point[0] * axis[0] + point[1] * axis[1] for point in points]
+    return min(values), max(values)
+
+
+def _can_extend_text_block(
+    previous: PdfTextLine,
+    current: PdfTextLine,
+    previous_column: int,
+    current_column: int,
+) -> bool:
+    if previous_column != current_column:
+        return False
+    if previous.is_header_footer != current.is_header_footer:
+        return False
+    if not _same_text_direction(previous, current):
+        return False
+    scale = max(
+        float(previous.font_size or 0.0),
+        float(current.font_size or 0.0),
+        previous.height,
+        current.height,
+        1.0,
+    )
+    direction = _rotation_direction(previous.rotation)
+    normal = (-direction[1], direction[0])
+    previous_low, previous_high = _line_projection_interval(previous, normal)
+    current_low, current_high = _line_projection_interval(current, normal)
+    if current_low >= previous_high:
+        gap = current_low - previous_high
+    elif previous_low >= current_high:
+        gap = previous_low - current_high
+    else:
+        gap = 0.0
+    return gap <= max(8.0, scale * 1.75)
+
+
+def _build_text_blocks(
+    lines: tuple[PdfTextLine, ...],
+    *,
+    boundaries: tuple[float, ...],
+    page_width: float,
+) -> tuple[PdfTextBlock, ...]:
+    """按方向、栏位和行间距把文本行聚合成几何版面块。"""
+    blocks: list[PdfTextBlock] = []
+    current: list[PdfTextLine] = []
+    current_column = 0
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            blocks.append(_text_block_from_lines(current, current_column))
+            current = []
+
+    for line in lines:
+        column = _line_column_index(line, boundaries, page_width)
+        if not current:
+            current = [line]
+            current_column = column
+            continue
+        if not _can_extend_text_block(
+            current[-1], line, current_column, column
+        ):
+            flush()
+            current_column = column
+        current.append(line)
+    flush()
+    return tuple(blocks)
 
 
 def _line_column_bounds(

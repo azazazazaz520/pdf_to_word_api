@@ -217,6 +217,7 @@ def measure_offsets(
 ) -> dict[str, list[float]]:
     """从渲染出的 PDF 中测量每个样本的字形框顶部，返回 字体 -> k 列表。"""
     import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_raw
 
     samples: dict[str, list[float]] = {}
     used: set[int] = set()
@@ -227,10 +228,39 @@ def measure_offsets(
             text_page = page.get_textpage()
             try:
                 characters: list[tuple[float, float, float, float]] = []
-                for index, character in enumerate(text_page.get_text_range()):
-                    if character in "\r\n":
+                try:
+                    count = int(text_page.count_chars())
+                except Exception:
+                    count = len(text_page.get_text_range())
+                for index in range(max(count, 0)):
+                    try:
+                        codepoint = int(
+                            pdfium_raw.FPDFText_GetUnicode(
+                                text_page.raw,
+                                index,
+                            )
+                        )
+                        character = (
+                            chr(codepoint)
+                            if codepoint and codepoint <= 0x10FFFF
+                            else ""
+                        )
+                    except Exception:
+                        try:
+                            character = text_page.get_text_range(index, 1)[:1]
+                        except Exception:
+                            try:
+                                character = text_page.get_text_range()[
+                                    index : index + 1
+                                ]
+                            except Exception:
+                                character = ""
+                    if character in {"", "\r", "\n"}:
                         continue
-                    x0, y0, x1, y1 = text_page.get_charbox(index)
+                    try:
+                        x0, y0, x1, y1 = text_page.get_charbox(index)
+                    except Exception:
+                        continue
                     if x1 - x0 <= 0 and y1 - y0 <= 0:
                         continue
                     characters.append(

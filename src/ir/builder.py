@@ -4,7 +4,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
-from .model import IRBlock, IRDocument, IRPage, IRTextLine, IRTextSpan, IRWarning
+from .model import (
+    IRBlock,
+    IRDocument,
+    IRPage,
+    IRTextGlyph,
+    IRTextLine,
+    IRTextSpan,
+    IRWarning,
+)
 from ..layout.models import PdfDocumentLayout, PdfPageLayout, PdfTextLine
 from ..export.content import (
     _group_text_lines,
@@ -124,6 +132,32 @@ def _ir_text_line(
         pdf_font_name=getattr(line, "pdf_font_name", ""),
         substituted=bool(getattr(line, "font_substituted", False)),
         fallback_reason=getattr(line, "font_fallback_reason", ""),
+        direction=tuple(getattr(line, "direction", (1.0, 0.0))),
+        glyphs=tuple(
+            _ir_text_glyph(glyph)
+            for glyph in getattr(line, "glyphs", ())
+        ),
+    )
+
+
+def _ir_text_glyph(glyph: Any) -> IRTextGlyph:
+    bbox = getattr(glyph, "bbox", (0.0, 0.0, 0.0, 0.0))
+    return IRTextGlyph(
+        text=glyph.text,
+        bbox=tuple(float(value) for value in bbox),
+        font_name=getattr(glyph, "font_name", ""),
+        pdf_font_name=getattr(glyph, "pdf_font_name", ""),
+        font_size=float(getattr(glyph, "font_size", 0.0) or 0.0),
+        color=getattr(glyph, "color", None),
+        bold=bool(getattr(glyph, "bold", False)),
+        italic=bool(getattr(glyph, "italic", False)),
+        rotation=float(getattr(glyph, "rotation", 0.0) or 0.0),
+        direction=tuple(getattr(glyph, "direction", (1.0, 0.0))),
+        z_order=int(getattr(glyph, "z_order", 0) or 0),
+        char_index=int(getattr(glyph, "char_index", -1)),
+        object_index=int(getattr(glyph, "object_index", -1)),
+        substituted=bool(getattr(glyph, "substituted", False)),
+        fallback_reason=getattr(glyph, "fallback_reason", ""),
     )
 
 
@@ -142,6 +176,11 @@ def _ir_text_span(span: Any) -> IRTextSpan:
         z_order=int(getattr(span, "z_order", 0) or 0),
         substituted=bool(getattr(span, "substituted", False)),
         fallback_reason=getattr(span, "fallback_reason", ""),
+        direction=tuple(getattr(span, "direction", (1.0, 0.0))),
+        glyphs=tuple(
+            _ir_text_glyph(glyph)
+            for glyph in getattr(span, "glyphs", ())
+        ),
     )
 
 
@@ -233,9 +272,26 @@ def build_text_page_ir(
     if fidelity:
         for vector in page.vectors:
             events.append((vector.bbox[1], 1, "vector", vector))
-    for line in body_lines:
-        if not any(_line_is_in_pdf_table(line, table) for table in page.tables):
-            events.append((line.top, 2, "line", line))
+    geometry_blocks = tuple(getattr(page, "text_blocks", ()) or ())
+    if geometry_blocks:
+        for text_block in geometry_blocks:
+            block_lines = [
+                line
+                for line in text_block.lines
+                if not line.is_header_footer
+                and not any(
+                    _line_is_in_pdf_table(line, table)
+                    for table in page.tables
+                )
+            ]
+            if block_lines:
+                events.append(
+                    (block_lines[0].top, 2, "text_block", block_lines)
+                )
+    else:
+        for line in body_lines:
+            if not any(_line_is_in_pdf_table(line, table) for table in page.tables):
+                events.append((line.top, 2, "line", line))
     events.sort(key=lambda item: (item[0], item[1]))
 
     text_lines = []
@@ -293,6 +349,10 @@ def build_text_page_ir(
     for _, _, kind, item in events:
         if kind == "line":
             text_lines.append(item)
+            continue
+        if kind == "text_block":
+            text_lines.extend(item)
+            flush_text()
             continue
         flush_text()
         if kind == "table":

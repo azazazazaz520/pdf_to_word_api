@@ -27,6 +27,46 @@ class IRWarning:
 
 
 @dataclass(frozen=True)
+class IRTextGlyph:
+    """IR 中可追溯到 PDF 原始字符的定位字形。"""
+
+    text: str
+    bbox: tuple[float, float, float, float]
+    font_name: str = ""
+    pdf_font_name: str = ""
+    font_size: float = 0.0
+    color: tuple[int, int, int] | None = None
+    bold: bool = False
+    italic: bool = False
+    rotation: float = 0.0
+    direction: tuple[float, float] = (1.0, 0.0)
+    z_order: int = 0
+    char_index: int = -1
+    object_index: int = -1
+    substituted: bool = False
+    fallback_reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "bbox": [round(value, 3) for value in self.bbox],
+            "font_name": self.font_name,
+            "pdf_font_name": self.pdf_font_name,
+            "font_size": round(self.font_size, 3),
+            "color": list(self.color) if self.color else None,
+            "bold": self.bold,
+            "italic": self.italic,
+            "rotation": round(self.rotation, 3),
+            "direction": [round(value, 6) for value in self.direction],
+            "z_order": self.z_order,
+            "char_index": self.char_index,
+            "object_index": self.object_index,
+            "font_substituted": self.substituted,
+            "font_fallback_reason": self.fallback_reason,
+        }
+
+
+@dataclass(frozen=True)
 class IRTextSpan:
     """行内一段同字体文本，用于精确还原混排字体。"""
 
@@ -42,6 +82,8 @@ class IRTextSpan:
     z_order: int = 0
     substituted: bool = False
     fallback_reason: str = ""
+    direction: tuple[float, float] = (1.0, 0.0)
+    glyphs: tuple[IRTextGlyph, ...] = ()
 
     @property
     def width(self) -> float:
@@ -58,9 +100,11 @@ class IRTextSpan:
             "bold": self.bold,
             "italic": self.italic,
             "rotation": round(self.rotation, 3),
+            "direction": [round(value, 6) for value in self.direction],
             "z_order": self.z_order,
             "font_substituted": self.substituted,
             "font_fallback_reason": self.fallback_reason,
+            "glyphs": [glyph.to_dict() for glyph in self.glyphs],
         }
 
 
@@ -89,6 +133,8 @@ class IRTextLine:
     pdf_font_name: str = ""
     substituted: bool = False
     fallback_reason: str = ""
+    direction: tuple[float, float] = (1.0, 0.0)
+    glyphs: tuple[IRTextGlyph, ...] = ()
 
     @property
     def width(self) -> float:
@@ -111,12 +157,14 @@ class IRTextLine:
             "line_spacing": round(self.line_spacing, 4),
             "first_line_indent": round(self.first_line_indent, 3),
             "rotation": round(self.rotation, 3),
+            "direction": [round(value, 6) for value in self.direction],
             "z_order": self.z_order,
             "confidence": self.confidence,
             "pdf_font_name": self.pdf_font_name,
             "font_substituted": self.substituted,
             "font_fallback_reason": self.fallback_reason,
             "spans": [span.to_dict() for span in self.spans],
+            "glyphs": [glyph.to_dict() for glyph in self.glyphs],
         }
 
 
