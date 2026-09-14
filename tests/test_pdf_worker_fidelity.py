@@ -5,6 +5,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from PIL import Image
 from reportlab.lib.utils import ImageReader
@@ -86,7 +87,7 @@ class PdfWorkerFidelityTest(unittest.TestCase):
             self.assertIn("<w:framePr", document_xml)
             self.assertNotIn('w:top="504"', document_xml)
 
-    def test_fidelity_keeps_page_image_fallback_for_visual_pages(self) -> None:
+    def test_fidelity_keeps_text_for_visual_pages(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             image_path = root / "full-page.png"
@@ -99,19 +100,53 @@ class PdfWorkerFidelityTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "succeeded")
             quality = result["quality"]
-            self.assertEqual(quality["route_summary"], {"text": 1, "page_image": 1})
+            self.assertEqual(quality["route_summary"], {"text": 2})
+            self.assertEqual(quality["visual_only_page_count"], 0)
             fidelity = quality["fidelity"]
-            self.assertEqual(fidelity["page_image_fallback_pages"], [2])
-            self.assertGreaterEqual(fidelity["fallback_region_count"], 1)
+            self.assertEqual(fidelity["page_image_fallback_pages"], [])
+            self.assertEqual(fidelity["fallback_region_count"], 0)
             page_two = next(
                 item for item in fidelity["pages"] if item["page"] == 2
             )
-            self.assertEqual(page_two["rebuild_confidence"], 0.8)
-            self.assertEqual(page_two["fallback_block_count"], 1)
-            self.assertFalse(page_two["editable"])
+            self.assertEqual(page_two["fallback_regions"], [])
+            self.assertTrue(page_two["editable"])
             with zipfile.ZipFile(root / "result.docx") as archive:
                 document_xml = archive.read("word/document.xml").decode("utf-8")
             self.assertIn("<wp:anchor", document_xml)
+
+    def test_render_validation_never_replaces_text_with_page_image(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "low-coverage.pdf"
+            _write_text_pdf(pdf_path, page_count=1)
+            payload = _base_payload(root, pdf_path, page_count=1)
+            payload["render_validation"] = True
+            payload["fidelity_auto_fallback"] = True
+
+            render_result = {
+                "status": "succeeded",
+                "source_page_count": 1,
+                "rendered_page_count": 1,
+                "page_delta": 0,
+                "blank_pages": [],
+                "unexpected_blank_pages": [],
+                "text_coverage": {
+                    "status": "succeeded",
+                    "pages": [{"page": 1, "coverage": 0.1}],
+                },
+            }
+            with patch.object(
+                __import__("src.pdf_worker", fromlist=["validate_docx_rendering"]),
+                "validate_docx_rendering",
+                return_value=render_result,
+            ) as validate:
+                result = process_job(payload)
+
+            self.assertEqual(validate.call_count, 1)
+            quality = result["quality"]
+            self.assertEqual(quality["fidelity_auto_fallback_pages"], [])
+            self.assertEqual(quality["fidelity"]["page_image_fallback_pages"], [])
+            self.assertEqual(quality["visual_only_page_count"], 0)
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ from .layout.images import DEFAULT_EMBEDDED_IMAGE_JPEG_QUALITY, DEFAULT_EMBEDDED
 from .layout.layout import extract_pdf_layout
 from .pdf_routing import analyze_pdf_text
 from .service.ocr_quality import summarize_ocr_page
-from .export.document_setup import page_render_scale, render_page_image_png
+from .export.document_setup import page_render_scale
 from .export.fidelity import DEFAULT_FIDELITY_FALLBACK_DPI, export_fidelity_docx
 from .page_render import render_page_image
 from .run_validation import build_pipeline
@@ -137,22 +137,8 @@ def _run_render_validation(
     writer: Any,
     route: str,
     route_reason: str,
-    emit_export_stage: Any,
-    export_fidelity_docx: Any,
-    font_plan: Any,
-    font_offsets: dict[str, float],
-    font_programs: dict[str, Any],
-    font_usage_report: dict[str, Any],
-    font_plan_report: dict[str, Any] | None,
-    font_metrics_report: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """渲染回读、保真验收与整页图片兜底。
-
-    整页兜底会改写 IR 的页面路由与可编辑状态，因此需要按兜底后的 IR
-    重建质量报告并返回给调用方；仅在函数内重新绑定局部变量不会影响调用方。
-
-    由调用方按 render_validation 开关决定是否执行；渲染失败只记录告警。
-    """
+    """渲染回读并执行保真验收；不修改 IR，也不使用整页图片兜底。"""
     if bool(payload.get("render_validation", False)):
         render_started = time.perf_counter()
         try:
@@ -206,119 +192,8 @@ def _run_render_validation(
             if toc_extra_pages:
                 acceptance["toc_extra_pages"] = toc_extra_pages
                 quality["fidelity_acceptance"] = acceptance
-            auto_fallback_pages: list[int] = []
-            layout_pages = {
-                int(item.get("page") or 0): item
-                for item in (
-                    (render_result.get("text_layout") or {}).get("pages") or []
-                )
-            }
-            coverage_pages = {
-                int(item.get("page") or 0): float(item.get("coverage") or 1.0)
-                for item in (
-                    (render_result.get("text_coverage") or {}).get("pages") or []
-                )
-            }
-            coverage_threshold = float(
-                payload.get("coverage_fallback_threshold", 0.90)
-            )
-            quality["fidelity_fallback_threshold"] = coverage_threshold
-            candidates = []
-            for page_number, coverage in coverage_pages.items():
-                if not 1 <= page_number <= len(ir.pages):
-                    continue
-                page = ir.pages[page_number - 1]
-                if page.route in {"page_image", "blank"}:
-                    # 本来就是整页图片/空白页，无需再兜底
-                    continue
-                # 只依据文字丢失程度贴图；图像相似度不参与判定
-                if coverage < coverage_threshold:
-                    candidates.append(page_number)
-            candidates.sort()
-            # 默认不生成兜底整页图片：文字缺失应由导出修正，而不是用截图掩盖
-            if not bool(payload.get("fidelity_auto_fallback", False)):
-                candidates = []
-            auto_fallback_pages: list[int] = []
-            if candidates:
-                auto_fallback_pages = _apply_page_image_fallback(
-                    ir,
-                    candidates,
-                    source_pdf=input_path,
-                    dpi=float(payload.get("fidelity_fallback_dpi", ssim_dpi)),
-                    max_pixels=int(
-                        payload.get("fidelity_page_image_max_pixels", 8_000_000)
-                    ),
-                )
-            if auto_fallback_pages:
-                writer.emit(
-                    "fidelity_auto_fallback_started",
-                    progress=98,
-                    route=route,
-                    route_reason="text_coverage_below_threshold",
-                    pages=auto_fallback_pages,
-                )
-                export_fidelity_docx(
-                    ir,
-                    output_path,
-                    title=Path(str(payload["filename"])).stem,
-                    source_pdf=input_path,
-                    include_toc=bool(payload.get("include_toc", False)),
-                    include_bookmarks=bool(
-                        payload.get("include_bookmarks", True)
-                    ),
-                    mode="fidelity",
-                    min_text_confidence=payload.get(
-                        "fidelity_min_text_confidence"
-                    ),
-                    fallback_dpi=float(
-                        payload.get(
-                            "fidelity_fallback_dpi",
-                            DEFAULT_FIDELITY_FALLBACK_DPI,
-                        )
-                    ),
-                    fallback_max_pixels=int(
-                        payload.get("fidelity_fallback_max_pixels", 2_000_000)
-                    ),
-                    font_plan=font_plan,
-                    font_offsets=font_offsets,
-                    font_programs=font_programs,
-                    stage_callback=emit_export_stage,
-                )
-                quality = ir.quality_report(compact=page_count > 200)
-                # 页面被替换成整页图片后 IR 里不再有文字，字体报告沿用兜底前的识别结果
-                quality["fonts"] = {
-                    **font_usage_report,
-                    "embedding": font_plan_report,
-                    "metrics": font_metrics_report,
-                    "measured_before_fallback": True,
-                }
-                quality["fidelity_auto_fallback_pages"] = auto_fallback_pages
-                _append_quality_warning(
-                    quality,
-                    code="fidelity_page_image_fallback_applied",
-                    message=(
-                        "以下页面重建后视觉差异过大，已自动改为整页"
-                        f"图片兜底：{auto_fallback_pages}。"
-                    ),
-                    page=None,
-                )
-                if bool(
-                    payload.get("fidelity_revalidate_after_fallback", True)
-                ):
-                    render_result = run_validation(
-                        page_indices=[
-                            number - 1 for number in auto_fallback_pages
-                        ]
-                    )
-                    _merge_render_validation(
-                        quality,
-                        render_result,
-                        expected_source_page_count=expected_source_page_count,
-                        ssim_threshold=ssim_threshold,
-                    )
-                else:
-                    quality["fidelity_revalidation_skipped"] = True
-                quality["fidelity_auto_fallback_pages"] = auto_fallback_pages
+            # 保留字段以兼容旧版质量报告；当前策略永远不替换页面内容。
+            quality["fidelity_auto_fallback_pages"] = []
             writer.emit(
                 "render_validation_completed",
                 progress=98,
@@ -335,7 +210,7 @@ def _run_render_validation(
                 max_bbox_error=(
                     render_result.get("text_layout") or {}
                 ).get("max_bbox_error"),
-                auto_fallback_pages=auto_fallback_pages,
+                auto_fallback_pages=[],
             )
         except Exception as error:
             quality["render_validation"] = {
@@ -461,25 +336,13 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                     raise RuntimeError("PDF 不满足文本层快速路线的检测阈值")
                 page_routes = ["text"] * analysis.page_count
             elif route_mode == "auto":
-                document_has_text = analysis.usable_page_count > 0
+                # 只要 PDF 有文字就进入文字布局；低质量文本也必须保留下来，
+                # 这样字符顺序、坐标和字体问题会在结果中暴露出来。
                 for page_analysis in analysis.pages:
-                    if page_analysis.text_char_count < min_page_chars:
-                        if document_has_text and (
-                            page_analysis.image_count > 0
-                            or page_analysis.full_page_image_count > 0
-                        ):
-                            page_routes.append("page_image")
-                        else:
-                            page_routes.append("ocr")
-                    elif (
-                        page_analysis.image_count >= 8
-                        and page_analysis.text_char_count < 1500
-                    ):
-                        page_routes.append("page_image")
-                    elif page_analysis.is_high_quality(min_page_chars=min_page_chars):
+                    if page_analysis.text_char_count > 0:
                         page_routes.append("text")
                     else:
-                        page_routes.append("page_image")
+                        page_routes.append("ocr")
             else:
                 raise RuntimeError(f"不支持的路由模式：{route_mode}")
 
@@ -541,7 +404,6 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             {"parsing_res_list": []} for _ in range(page_count)
         ]
         ocr_quality: list[dict[str, Any] | None] = [None] * page_count
-        ocr_page_images: dict[int, bytes] = {}
         if ocr_indices:
             model_started = time.perf_counter()
             writer.emit(
@@ -582,7 +444,6 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                         max_pixels=int(payload["page_image_max_pixels"]),
                         jpeg_quality=int(payload["page_image_jpeg_quality"]),
                     )
-                    ocr_page_images[index] = image_bytes
                     temporary_image = ocr_image_dir / f"page_{index + 1}.jpg"
                     temporary_image.write_bytes(image_bytes)
                     page_result: Any = {"parsing_res_list": []}
@@ -700,45 +561,6 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                     )
                 ),
             )
-            adjusted_pages = 0
-            for index, current_route in enumerate(page_routes):
-                if current_route != "text" or index >= len(layout.pages):
-                    continue
-                page = layout.pages[index]
-                body_lines = [
-                    line for line in page.lines if not line.is_header_footer
-                ]
-                if (
-                    len(body_lines) >= 58
-                    and not page.tables
-                    and not page.images
-                ):
-                    page_routes[index] = "page_image"
-                    adjusted_pages += 1
-            if adjusted_pages:
-                route_summary = {}
-                for page_route in page_routes:
-                    route_summary[page_route] = route_summary.get(page_route, 0) + 1
-                if all(item == "text" for item in page_routes):
-                    route = "text"
-                    route_reason = "text_layer_complete"
-                elif all(item == "page_image" for item in page_routes):
-                    route = "page_image"
-                    route_reason = "dense_or_image_page"
-                elif all(item == "ocr" for item in page_routes):
-                    route = "ocr"
-                    route_reason = "text_layer_not_usable"
-                else:
-                    route = "mixed"
-                    route_reason = "per_page_auto"
-                writer.emit(
-                    "per_page_route_adjusted",
-                    progress=66,
-                    route=route,
-                    route_reason="dense_text_page",
-                    adjusted_pages=adjusted_pages,
-                    route_summary=route_summary,
-                )
             writer.emit(
                 "text_layout_completed",
                 progress=65,
@@ -749,7 +571,8 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 elapsed_sec=round(time.perf_counter() - layout_started, 3),
             )
 
-        page_images: dict[int, bytes] = dict(ocr_page_images)
+        # OCR 图片只用于推理输入，不能进入 DOCX 成为页面背景或兜底内容。
+        page_images: dict[int, bytes] = {}
         ocr_scales: list[float | None] = [None] * page_count
         for index in ocr_indices:
             width, height = (
@@ -760,39 +583,6 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 height,
                 int(payload["page_image_max_pixels"]),
             )
-        image_indices = [
-            index for index, value in enumerate(page_routes) if value == "page_image"
-        ]
-        image_indices.extend(index for index in ocr_indices)
-        image_indices = sorted(set(image_indices))
-        if image_indices:
-            writer.emit(
-                "page_images_started",
-                progress=65,
-                route=route,
-                route_reason=route_reason,
-                page_count=len(image_indices),
-            )
-            for image_index in image_indices:
-                if image_index in page_images:
-                    continue
-                _raise_if_cancelled(cancel_path)
-                raise_if_timed_out("page_image_render_completed")
-                page_images[image_index] = render_page_image(
-                    input_path,
-                    image_index,
-                    max_pixels=int(payload["page_image_max_pixels"]),
-                    jpeg_quality=int(payload["page_image_jpeg_quality"]),
-                )
-                writer.emit(
-                    "page_image_completed",
-                    progress=min(85, 65 + int(20 * (len(page_images) / max(len(image_indices), 1)))),
-                    route=route,
-                    route_reason=route_reason,
-                    page=image_index + 1,
-                    page_count=len(page_images),
-                )
-
         text_confidence = (
             [page.quality_score for page in analysis.pages] if analysis else None
         )
@@ -892,14 +682,6 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 writer=writer,
                 route=route,
                 route_reason=route_reason,
-                emit_export_stage=emit_export_stage,
-                export_fidelity_docx=export_fidelity_docx,
-                font_plan=font_plan,
-                font_offsets=font_offsets,
-                font_programs=font_programs,
-                font_usage_report=font_usage_report,
-                font_plan_report=font_plan_report,
-                font_metrics_report=font_metrics_report,
             )
         quality["quality_gate"] = _evaluate_quality_gate(
             quality,
@@ -915,7 +697,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             _append_quality_warning(
                 quality,
                 code="quality_gate_failed",
-                message="质量门禁未通过：请检查渲染页数差或空白页。",
+                message="质量门禁未通过：请检查页数、空白页、高保真指标与编辑性。",
                 page=None,
             )
         writer.emit(
@@ -1011,7 +793,6 @@ from .worker.progress import (  # noqa: F401  # 保持原导入路径可用
 from .worker.quality import (  # noqa: F401  # 保持原导入路径可用
     _append_quality_warning,
     _apply_fidelity_acceptance,
-    _apply_page_image_fallback,
     _evaluate_quality_gate,
     _merge_render_validation,
 )

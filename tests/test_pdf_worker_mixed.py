@@ -93,7 +93,7 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
                 ]
             self.assertEqual(len(media), 1)
 
-    def test_mixed_document_uses_text_and_page_image_routes(self) -> None:
+    def test_mixed_document_keeps_text_on_visual_pages(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             image_path = root / "full-page.png"
@@ -123,16 +123,16 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
             quality = result["quality"]
             self.assertEqual(
                 quality["route_summary"],
-                {"text": 1, "page_image": 1},
+                {"text": 2},
             )
             self.assertEqual(quality["media_count"], 1)
-            self.assertEqual(quality["needs_review_pages"], [2])
+            self.assertEqual(quality["needs_review_pages"], [])
             page_routes = [item["route"] for item in quality["page_results"]]
-            self.assertEqual(page_routes, ["text", "page_image"])
+            self.assertEqual(page_routes, ["text", "text"])
 
             stage_log = (root / "stages.jsonl").read_text(encoding="utf-8")
             events = [json.loads(line) for line in stage_log.splitlines()]
-            self.assertTrue(
+            self.assertFalse(
                 any(event.get("stage") == "page_image_completed" for event in events)
             )
 
@@ -171,6 +171,7 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
                 [item["route"] for item in quality["page_results"]],
                 ["text", "ocr"],
             )
+            self.assertEqual(quality["visual_only_page_count"], 0)
             paragraphs = "\n".join(
                 paragraph.text
                 for paragraph in __import__("docx").Document(
@@ -179,14 +180,11 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
             )
             self.assertIn("First page has selectable text", paragraphs)
             fidelity = quality["fidelity"]
-            self.assertIn(2, fidelity["page_image_fallback_pages"])
+            self.assertEqual(fidelity["page_image_fallback_pages"], [])
             ocr_page = next(
                 item for item in fidelity["pages"] if item["page"] == 2
             )
-            self.assertIn(
-                "ocr_page_preserved_as_image",
-                [region["reason"] for region in ocr_page["fallback_regions"]],
-            )
+            self.assertEqual(ocr_page["fallback_regions"], [])
 
 
 
@@ -290,6 +288,78 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
                 and check["status"] == "failed"
                 for check in gate["checks"]
             )
+        )
+
+    def test_quality_gate_fails_fidelity_mismatch_with_matching_page_count(self) -> None:
+        quality = {
+            "render_validation": {
+                "status": "succeeded",
+                "source_page_count": 20,
+                "page_delta": 0,
+                "blank_pages": [],
+            },
+            "fidelity_acceptance": {
+                "page_count_match": True,
+                "no_unexpected_blank_pages": True,
+                "ssim_ok": False,
+                "bbox_ok": False,
+                "font_size_ok": True,
+            },
+        }
+
+        gate = _evaluate_quality_gate(
+            quality,
+            enabled=True,
+            page_delta_warn_ratio=0.05,
+            page_delta_warn_absolute=3,
+        )
+
+        self.assertEqual(gate["status"], "failed")
+        self.assertEqual(
+            {
+                check["name"]
+                for check in gate["checks"]
+                if check["status"] == "failed"
+            },
+            {"fidelity_ssim", "fidelity_bbox"},
+        )
+
+    def test_quality_gate_rejects_visual_only_pages(self) -> None:
+        quality = {
+            "render_validation": {
+                "status": "succeeded",
+                "source_page_count": 2,
+                "page_delta": 0,
+                "blank_pages": [],
+            },
+            "fidelity_acceptance": {
+                "page_count_match": True,
+                "no_unexpected_blank_pages": True,
+                "ssim_ok": True,
+                "bbox_ok": True,
+                "font_size_ok": True,
+            },
+            "page_results": [
+                {"page": 1, "route": "text", "editable": True},
+                {"page": 2, "route": "page_image", "editable": False},
+            ],
+        }
+
+        gate = _evaluate_quality_gate(
+            quality,
+            enabled=True,
+            page_delta_warn_ratio=0.05,
+            page_delta_warn_absolute=3,
+        )
+
+        self.assertEqual(gate["status"], "failed")
+        self.assertIn(
+            "editable_pages",
+            {
+                check["name"]
+                for check in gate["checks"]
+                if check["status"] == "failed"
+            },
         )
 
 

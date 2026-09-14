@@ -1,19 +1,12 @@
-"""质量报告与验收判定：告警、门禁、渲染结果合并、保真验收、整页兜底。
+"""质量报告与验收判定：告警、门禁、渲染结果合并与保真验收。
 
 质量门禁与验收结论在此处生成，供 worker 编排层与对外接口读取。
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-from ..ir.model import IRBlock, IRDocument, IRWarning
-from ..export.document_setup import render_page_image_png
-from ..page_render import render_page_image
-
-# 整页贴图的触发依据：该页渲染后文字覆盖率不足，即内容确实丢失
-_PAGE_IMAGE_FALLBACK_REASON = "auto_fallback_text_coverage_below_threshold"
 
 
 def _append_quality_warning(
@@ -95,6 +88,44 @@ def _evaluate_quality_gate(
             "detail": f"blank_pages={blank_pages}",
         },
     ]
+    fidelity_acceptance = quality.get("fidelity_acceptance")
+    if isinstance(fidelity_acceptance, dict):
+        for key, name in (
+            ("page_count_match", "fidelity_page_count"),
+            ("no_unexpected_blank_pages", "fidelity_blank_pages"),
+            ("ssim_ok", "fidelity_ssim"),
+            ("bbox_ok", "fidelity_bbox"),
+            ("font_size_ok", "fidelity_font_size"),
+        ):
+            value = fidelity_acceptance.get(key)
+            checks.append(
+                {
+                    "name": name,
+                    "status": "passed" if value is True else "failed",
+                    "detail": f"{key}={value!r}",
+                }
+            )
+
+    page_results = quality.get("page_results") or []
+    visual_only_pages = [
+        int(item["page"])
+        for item in page_results
+        if item.get("route") != "blank" and not bool(item.get("editable", True))
+    ]
+    fallback_pages = list(
+        (quality.get("fidelity") or {}).get("page_image_fallback_pages") or []
+    )
+    if visual_only_pages or fallback_pages:
+        checks.append(
+            {
+                "name": "editable_pages",
+                "status": "failed",
+                "detail": (
+                    f"visual_only_pages={sorted(set(visual_only_pages))}, "
+                    f"page_image_fallback_pages={sorted(set(fallback_pages))}"
+                ),
+            }
+        )
     status = "passed" if all(
         check["status"] == "passed" for check in checks
     ) else "failed"
@@ -238,74 +269,3 @@ def _merge_render_validation(
         render_result,
         ssim_threshold=ssim_threshold,
     )
-
-
-def _apply_page_image_fallback(
-    ir: Any,
-    page_numbers: list[int],
-    *,
-    source_pdf: Path,
-    dpi: float,
-    max_pixels: int,
-) -> list[int]:
-    """把 SSIM 不达标的页面替换为整页 PNG 兜底。"""
-    applied: list[int] = []
-    wanted = {int(number) for number in page_numbers}
-    for page in ir.pages:
-        if page.page_number not in wanted:
-            continue
-        try:
-            image_bytes = render_page_image_png(
-                source_pdf,
-                page.page_number - 1,
-                dpi=dpi,
-                max_pixels=max_pixels,
-            )
-        except Exception:
-            continue
-        page.blocks = [
-            IRBlock(
-                kind="page_image",
-                page=page.page_number,
-                source="auto_fidelity_fallback",
-                image_bytes=image_bytes,
-                image_width=page.width,
-                image_height=page.height,
-                bbox=(0.0, 0.0, page.width, page.height),
-                layer="background",
-                confidence=1.0,
-                fallback_reason=_PAGE_IMAGE_FALLBACK_REASON,
-            )
-        ]
-        page.route = "page_image"
-        page.editable = False
-        page.reconstruction_confidence = 0.8
-        page.fidelity = {
-            "rebuild_confidence": 0.8,
-            "force_page_image": True,
-            "force_page_image_reason": _PAGE_IMAGE_FALLBACK_REASON,
-            "page_image_fallback": True,
-            "fallback_regions": [
-                {
-                    "kind": "page_image",
-                    "layer": "background",
-                    "bbox": [0.0, 0.0, round(page.width, 2), round(page.height, 2)],
-                    "reason": _PAGE_IMAGE_FALLBACK_REASON,
-                }
-            ],
-            "native_block_count": 0,
-            "image_fallback_count": 1,
-        }
-        page.add_warning(
-            IRWarning(
-                code="fidelity_page_image_fallback",
-                message=(
-                    f"第 {page.page_number} 页重建后 SSIM 低于阈值，"
-                    "已自动改为整页图片兜底。"
-                ),
-                page=page.page_number,
-                severity="warning",
-            )
-        )
-        applied.append(page.page_number)
-    return applied
