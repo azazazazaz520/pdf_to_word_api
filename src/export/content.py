@@ -25,6 +25,9 @@ _SECTION_HEADING = re.compile(
 _SUBSECTION_HEADING = re.compile(r"^\s*\d+\.\d+(?:\s|$)")
 _NUMERIC_SECTION_HEADING = re.compile(r"^\s*\d+\.(?!\d)\s+\S+")
 _LIST_ROLES = frozenset({"ordered", "bullet", "plugin"})
+_LINE_END_HYPHENS = frozenset(
+    {"-", "\u00ad", "\u2010", "\u2011", "\u2012", "\u2013", "\u2014"}
+)
 
 
 def _ordered_blocks(result: Any) -> Iterable[Any]:
@@ -245,6 +248,8 @@ def _is_sentence_terminal(line: str) -> bool:
 
 def _needs_word_space(previous: str, current: str) -> bool:
     if not previous or not current:
+        return False
+    if previous[-1] in _LINE_END_HYPHENS:
         return False
     if previous[-1] in "+-=*/≤≥≈":
         return True

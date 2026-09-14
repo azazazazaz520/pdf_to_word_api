@@ -5,6 +5,8 @@
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 from typing import Any
 from .models import (
     PdfTextGlyph,
@@ -450,6 +452,25 @@ def _direction_from_rotation(rotation: float) -> tuple[float, float]:
     return (round(math.cos(radians), 6), round(math.sin(radians), 6))
 
 
+def _normalize_aggregated_text(
+    value: str,
+    *,
+    trim_edges: bool = False,
+) -> str:
+    """在字符已按几何顺序聚合后归一化文本。"""
+    if not value:
+        return ""
+    normalized = "".join(
+        character
+        if character in {" ", "\t"}
+        else " "
+        if character.isspace()
+        else _compact_text(character)
+        for character in value
+    )
+    return normalized.strip(" \t") if trim_edges else normalized
+
+
 def _styles_by_object(
     styles: list[_TextObjectStyle] | None,
 ) -> dict[int, _TextObjectStyle]:
@@ -503,8 +524,7 @@ def _extract_text_characters(
             raw_text
         ):
             continue
-        text = raw_text if raw_text.isspace() else _compact_text(raw_text)
-        if not text:
+        if not raw_text:
             continue
         try:
             x0, y0, x1, y1 = (
@@ -518,7 +538,7 @@ def _extract_text_characters(
         rotation = raw_rotation if raw_rotation is not None else 0.0
         direction = _direction_from_rotation(rotation)
         character = _TextCharacter(
-            text=text,
+            text=raw_text,
             x0=x0,
             top=page_height - max(y0, y1),
             x1=x1,
@@ -694,7 +714,7 @@ def _split_geometry_row(
         if float(item.font_size) > 0.2
     ]
     line_size = sizes[len(sizes) // 2] if sizes else 8.0
-    split_gap = max(line_size * 1.6, 8.0)
+    split_gap = max(line_size * 1.3, 8.0)
     runs: list[list[_TextCharacter]] = []
     current: list[_TextCharacter] = []
     previous_end = None
@@ -892,7 +912,10 @@ def _build_text_line(
         return None
     line_rotation = _mean_rotation(characters) if rotation is None else rotation
     ordered = _ordered_characters(characters, line_rotation)
-    text = _compact_text("".join(item.text for item in ordered))
+    text = _normalize_aggregated_text(
+        "".join(item.text for item in ordered),
+        trim_edges=True,
+    )
     if not text:
         return None
     font_sizes = sorted(
@@ -900,7 +923,9 @@ def _build_text_line(
     )
     font_names = [item.font_name for item in ordered if item.font_name]
     colors = [item.color for item in ordered]
-    spans = _build_text_spans(ordered, rotation=line_rotation)
+    spans = _trim_span_edges(
+        list(_build_text_spans(ordered, rotation=line_rotation))
+    )
     dominant_span = max(spans, key=lambda item: len(item.text), default=None)
     glyphs = tuple(_glyph_from_character(item) for item in ordered)
     return PdfTextLine(
@@ -999,6 +1024,43 @@ def _same_font_run(
     return abs(size - line_size) <= tolerance
 
 
+def _move_boundary_whitespace(
+    groups: list[list[_TextCharacter]],
+) -> list[list[_TextCharacter]]:
+    """把字体切换处的前导空白归到前一个可见文本组。"""
+    result: list[list[_TextCharacter]] = []
+    for source in groups:
+        group = list(source)
+        if result:
+            prefix_length = 0
+            while (
+                prefix_length < len(group)
+                and group[prefix_length].text.isspace()
+            ):
+                prefix_length += 1
+            if prefix_length:
+                result[-1].extend(group[:prefix_length])
+                group = group[prefix_length:]
+        if group:
+            result.append(group)
+    return result
+
+
+def _trim_span_edges(
+    spans: list[PdfTextSpan],
+) -> tuple[PdfTextSpan, ...]:
+    """移除整行两端的布局空白，保留 span 之间的词间空格。"""
+    if not spans:
+        return ()
+    result = list(spans)
+    if len(result) == 1:
+        text = result[0].text.strip(" \t")
+        return (replace(result[0], text=text),) if text else ()
+    result[0] = replace(result[0], text=result[0].text.lstrip(" \t"))
+    result[-1] = replace(result[-1], text=result[-1].text.rstrip(" \t"))
+    return tuple(span for span in result if span.text)
+
+
 def _build_text_spans(
     characters: list[_TextCharacter],
     *,
@@ -1029,10 +1091,13 @@ def _build_text_spans(
         current.append(character)
     if current:
         groups.append(current)
+    groups = _move_boundary_whitespace(groups)
 
     spans: list[PdfTextSpan] = []
     for group in groups:
-        span_text = _compact_text("".join(item.text for item in group))
+        span_text = _normalize_aggregated_text(
+            "".join(item.text for item in group)
+        )
         if not span_text:
             continue
         # 外框退化的字符（如零高度空格）字号也随之退化，不能作为片段样式来源

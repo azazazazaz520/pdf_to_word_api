@@ -9,9 +9,15 @@ from unittest.mock import patch
 
 from reportlab.pdfgen.canvas import Canvas
 
+from src.export.content import _join_wrapped_lines
 from src.ir.builder import build_document_ir
 from src.layout.layout import extract_pdf_layout
-from src.layout.text import _extract_text_characters
+from src.layout.models import _TextCharacter
+from src.layout.text import (
+    _build_text_line,
+    _build_text_spans,
+    _extract_text_characters,
+)
 
 
 def _write_geometry_sample(path: Path) -> None:
@@ -36,6 +42,26 @@ def _write_geometry_sample(path: Path) -> None:
 
 
 class TextGeometryTest(unittest.TestCase):
+    @staticmethod
+    def _character(
+        text: str,
+        *,
+        x0: float,
+        font_name: str,
+        char_index: int,
+    ) -> _TextCharacter:
+        return _TextCharacter(
+            text=text,
+            x0=x0,
+            top=10.0,
+            x1=x0 + (0.5 if text.isspace() else 5.0),
+            bottom=20.0,
+            font_size=10.0,
+            font_name=font_name,
+            pdf_font_name=font_name,
+            char_index=char_index,
+        )
+
     def test_internal_character_indices_are_not_text_buffer_indices(self) -> None:
         class FakeTextPage:
             raw = object()
@@ -115,6 +141,50 @@ class TextGeometryTest(unittest.TestCase):
             self.assertTrue(all(glyph.pdf_font_name for glyph in glyphs))
             self.assertTrue(all(glyph.font_size > 0 for glyph in glyphs))
             self.assertTrue(any(abs(glyph.rotation) > 1.0 for glyph in glyphs))
+
+    def test_boundary_spaces_survive_font_span_aggregation(self) -> None:
+        characters = [
+            self._character("a", x0=0.0, font_name="Regular", char_index=0),
+            self._character(" ", x0=5.5, font_name="Italic", char_index=1),
+            self._character("b", x0=6.0, font_name="Italic", char_index=2),
+        ]
+
+        spans = _build_text_spans(characters, rotation=0.0)
+        line = _build_text_line(characters, rotation=0.0)
+
+        self.assertEqual([span.text for span in spans], ["a ", "b"])
+        self.assertIsNotNone(line)
+        self.assertEqual(line.text, "a b")
+        self.assertEqual("".join(span.text for span in line.spans), "a b")
+        self.assertEqual("".join(glyph.text for glyph in line.glyphs), "a b")
+
+    def test_wrapped_line_hyphen_is_not_followed_by_extra_space(self) -> None:
+        self.assertEqual(
+            _join_wrapped_lines(["pre-", "trained"]),
+            "pre-trained",
+        )
+        self.assertEqual(
+            _join_wrapped_lines(["state-of-", "the-art"]),
+            "state-of-the-art",
+        )
+
+    def test_same_visual_row_uses_left_to_right_order(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            pdf_path = Path(temporary_directory) / "reading-order.pdf"
+            canvas = Canvas(str(pdf_path), pagesize=(400.0, 400.0))
+            canvas.setFont("Helvetica", 10)
+            canvas.drawString(200, 300, "right")
+            canvas.drawString(40, 300, "left")
+            canvas.save()
+
+            page = extract_pdf_layout(pdf_path).pages[0]
+            row = [
+                line.text
+                for line in page.lines
+                if line.text in {"left", "right"}
+            ]
+
+            self.assertEqual(row, ["left", "right"])
 
     def test_rotated_text_is_not_merged_into_horizontal_line(self) -> None:
         with TemporaryDirectory() as temporary_directory:
