@@ -99,8 +99,8 @@ class HybridExportTest(unittest.TestCase):
 
     def test_unicode_math_formula_is_split_from_following_prose(self) -> None:
         formula = (
-            "lrate = dm−o0d.e5l · min(step_num−0.5, "
-            "step_num · warmup_steps−1.5)"
+            "score = d−0.5 · min(step−0.5, "
+            "n · m−1.5)"
         )
         self.assertTrue(_is_formula_line(formula))
         lines = tuple(

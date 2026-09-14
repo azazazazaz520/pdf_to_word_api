@@ -162,7 +162,7 @@ class StructuredExportTest(unittest.TestCase):
         self.assertIn('w:line="220"', document_xml)
         self.assertNotIn('w:line="22"', document_xml)
 
-    def test_rotated_text_is_page_anchored_instead_of_horizontal_flow_text(self) -> None:
+    def test_rotated_text_remains_editable_without_image_fallback(self) -> None:
         ir = IRDocument(
             pages=[
                 IRPage(
@@ -190,11 +190,11 @@ class StructuredExportTest(unittest.TestCase):
             with zipfile.ZipFile(output_path) as archive:
                 document_xml = archive.read("word/document.xml").decode("utf-8")
 
-        self.assertEqual(report["rotated_text_image_fallback_count"], 1)
-        self.assertIn("<wp:anchor", document_xml)
-        self.assertNotIn("侧边元数据", document_xml)
+        self.assertEqual(report["rotated_text_image_fallback_count"], 0)
+        self.assertNotIn("<wp:anchor", document_xml)
+        self.assertIn("侧边元数据", document_xml)
 
-    def test_grid_like_text_is_degraded_locally_without_bullets(self) -> None:
+    def test_grid_like_text_remains_editable_without_image_fallback(self) -> None:
         lines = tuple(
             IRTextLine(
                 text=text,
@@ -217,7 +217,7 @@ class StructuredExportTest(unittest.TestCase):
                     route="text",
                     blocks=[
                         IRBlock(
-                            kind="bullet",
+                            kind="paragraph",
                             page=1,
                             text="甲乙丙丁",
                             bbox=(40.0, 40.0, 200.0, 65.0),
@@ -236,10 +236,10 @@ class StructuredExportTest(unittest.TestCase):
             with zipfile.ZipFile(output_path) as archive:
                 document_xml = archive.read("word/document.xml").decode("utf-8")
 
-        self.assertEqual(report["text_image_fallback_count"], 1)
+        self.assertEqual(report["text_image_fallback_count"], 0)
         self.assertEqual(len(document.paragraphs), 1)
         self.assertNotIn("ListBullet", document_xml)
-        self.assertNotIn("甲乙丙丁", document_xml)
+        self.assertIn("甲乙丙丁", document_xml)
 
     def test_writes_flow_text_table_omml_and_inline_image(self) -> None:
         ir = IRDocument(

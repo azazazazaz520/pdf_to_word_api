@@ -383,61 +383,6 @@ def _render_block_region(
         return None
 
 
-def _is_grid_like_text_block(block: IRBlock) -> bool:
-    """判断文本块是否由多个横向单元格组成，而非连续正文。"""
-    lines = list(block.lines or ())
-    if len(lines) < 4 or block.bbox is None:
-        return False
-    if any(
-        str(line.text or "").lstrip().startswith(("•", "·", "●", "▪", "◦"))
-        for line in lines
-    ):
-        return False
-    rows: list[list[IRTextLine]] = []
-    for line in sorted(
-        lines,
-        key=lambda item: (
-            (float(item.bbox[1]) + float(item.bbox[3])) / 2.0,
-            float(item.bbox[0]),
-        ),
-    ):
-        center = (float(line.bbox[1]) + float(line.bbox[3])) / 2.0
-        font_size = max(float(line.font_size or 0.0), 1.0)
-        tolerance = max(1.5, min(4.0, font_size * 0.45))
-        if rows:
-            previous = rows[-1]
-            previous_center = sum(
-                (float(item.bbox[1]) + float(item.bbox[3])) / 2.0
-                for item in previous
-            ) / len(previous)
-            if abs(center - previous_center) <= tolerance:
-                previous.append(line)
-                continue
-        rows.append([line])
-    multi_line_rows = sum(len(row) >= 2 for row in rows)
-    return len(rows) >= 2 and multi_line_rows >= 2
-
-
-def _is_colliding_text_block(block: IRBlock) -> bool:
-    """检测同一文本行中互相覆盖、导致字符交错的 PDF 文本层。"""
-    lines = list(block.lines or ())
-    if len(lines) != 1:
-        return False
-    spans = list(lines[0].spans or ())
-    if len(spans) < 8:
-        return False
-    font_size = max(float(lines[0].font_size or 0.0), 1.0)
-    vertical_range = max(float(span.bbox[3]) for span in spans) - min(
-        float(span.bbox[1]) for span in spans
-    )
-    overlaps = sum(
-        min(float(left.bbox[2]), float(right.bbox[2]))
-        > max(float(left.bbox[0]), float(right.bbox[0]))
-        for left, right in zip(spans, spans[1:])
-    )
-    return vertical_range > font_size * 0.65 and overlaps >= 3
-
-
 def _table_cell_line_count(value: Any) -> int:
     return sum(bool(line.strip()) for line in str(value or "").splitlines())
 
@@ -631,100 +576,6 @@ def _formula_regions(page: IRPage) -> tuple[tuple[float, float, float, float], .
             )
         )
     return tuple(sorted(regions, key=lambda bbox: (bbox[1], bbox[0])))
-
-
-def _add_text_region_fallback(
-    document: Any,
-    page: IRPage,
-    block: IRBlock,
-    *,
-    source_pdf: Path | None,
-    margin_points: float,
-    max_fallback_pixels: int,
-    report: dict[str, Any],
-    reason: str = "complex_text_grid_rasterized",
-) -> Any | None:
-    """复杂文本网格局部转图，避免误套列表样式破坏版式。"""
-    image_bytes = _render_block_region(
-        source_pdf,
-        page,
-        block,
-        max_pixels=max_fallback_pixels,
-    )
-    if not image_bytes:
-        return None
-    image_block = IRBlock(
-        kind="image",
-        page=block.page,
-        bbox=block.bbox,
-        image_bytes=image_bytes,
-        image_width=block.width,
-        image_height=block.height,
-        image_alt="复杂文本块局部图像",
-        source="text_grid_fallback",
-    )
-    paragraph = _add_inline_image(
-        document,
-        image_block,
-        page,
-        margin_points=margin_points,
-    )
-    if paragraph is None:
-        return None
-    report["text_image_fallback_count"] += 1
-    _record_placement(
-        report,
-        block,
-        status="image_fallback",
-        reason=reason,
-    )
-    return paragraph
-
-
-def _add_rotated_text_fallback(
-    document: Any,
-    page: IRPage,
-    block: IRBlock,
-    *,
-    source_pdf: Path | None,
-    max_fallback_pixels: int,
-    report: dict[str, Any],
-) -> Any | None:
-    """把旋转文本作为页面锚定局部图像，避免旋转被错误地横排。"""
-    if block.bbox is None:
-        return None
-    image_bytes = _render_block_region(
-        source_pdf,
-        page,
-        block,
-        max_pixels=max_fallback_pixels,
-    )
-    if not image_bytes:
-        return None
-    x0, top, x1, bottom = (float(value) for value in block.bbox)
-    width = max(x1 - x0, 0.5)
-    height = max(bottom - top, 0.5)
-    paragraph = new_canvas_paragraph(document)
-    add_absolute_picture(
-        document,
-        image_bytes,
-        x_points=x0,
-        y_points=top,
-        width_points=width,
-        height_points=height,
-        z_order=block.z_order,
-        object_id=1000 + len(report["placements"]),
-        name=f"rotated_text_{page.page_number}_{len(report['placements'])}",
-        paragraph=paragraph,
-    )
-    report["rotated_text_image_fallback_count"] += 1
-    _record_placement(
-        report,
-        block,
-        status="image_fallback",
-        reason="rotated_text_page_anchor",
-    )
-    return paragraph
 
 
 def _should_use_page_image_fallback(
@@ -1072,42 +923,6 @@ def _add_page_block(
     report: dict[str, Any],
 ) -> Any | None:
     if block.kind in FLOW_TEXT_KINDS:
-        if abs(float(block.rotation or 0.0)) >= 1.0:
-            paragraph = _add_rotated_text_fallback(
-                document,
-                page,
-                block,
-                source_pdf=source_pdf,
-                max_fallback_pixels=max_fallback_pixels,
-                report=report,
-            )
-            if paragraph is not None:
-                return paragraph
-        if _is_colliding_text_block(block):
-            paragraph = _add_text_region_fallback(
-                document,
-                page,
-                block,
-                source_pdf=source_pdf,
-                margin_points=margin_points,
-                max_fallback_pixels=max_fallback_pixels,
-                report=report,
-                reason="colliding_text_rasterized",
-            )
-            if paragraph is not None:
-                return paragraph
-        if _is_grid_like_text_block(block):
-            paragraph = _add_text_region_fallback(
-                document,
-                page,
-                block,
-                source_pdf=source_pdf,
-                margin_points=margin_points,
-                max_fallback_pixels=max_fallback_pixels,
-                report=report,
-            )
-            if paragraph is not None:
-                return paragraph
         paragraph = _add_text_block(document, block, font_plan=font_plan)
         report["text_paragraph_count"] += 1
         _record_placement(report, block, status="native", reason="flow_paragraph")
