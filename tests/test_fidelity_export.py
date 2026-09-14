@@ -216,7 +216,7 @@ class FidelityExportTest(unittest.TestCase):
                 self.assertLess(abs(frame["font_size"] - line.font_size), 0.5)
             self.assertGreaterEqual(checked, 6)
 
-    def test_low_confidence_text_uses_region_image_fallback(self) -> None:
+    def test_low_confidence_text_remains_editable_without_image_fallback(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             pdf_path = root / "sample.pdf"
@@ -237,17 +237,12 @@ class FidelityExportTest(unittest.TestCase):
                 source_pdf=pdf_path,
                 mode="fidelity_hybrid",
             )
-            self.assertGreaterEqual(report["fallback_region_count"], 1)
-            reasons = [
-                region["reason"]
-                for region in ir.pages[0].fidelity["fallback_regions"]
-            ]
-            self.assertTrue(
-                any(reason.startswith("low_confidence") for reason in reasons)
-            )
+            self.assertEqual(report["fallback_region_count"], 0)
+            self.assertEqual(ir.pages[0].fidelity["fallback_regions"], [])
             xml = _document_xml(hybrid_output)
-            self.assertIn("<wp:anchor", xml)
-            self.assertTrue(
+            self.assertIn("Body line 0", xml)
+            self.assertNotIn("fallback_1_", xml)
+            self.assertFalse(
                 any(
                     warning.code == "fidelity_region_fallback"
                     for warning in ir.pages[0].warnings

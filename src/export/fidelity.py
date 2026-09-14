@@ -250,7 +250,13 @@ def _fidelity_fallback_reason(
     *,
     min_confidence: float,
 ) -> str:
-    """判断块是否必须使用区域图片兜底。"""
+    """判断非正文块是否需要区域图片兜底。
+
+    正文即使置信度较低，也必须保留为可编辑文字；置信度只用于报告，
+    不再触发文字区域图片。
+    """
+    if block.kind in _FIDELITY_TEXT_KINDS:
+        return ""
     if block.fallback_reason:
         return block.fallback_reason
     if block.fallback_image is not None:
@@ -261,12 +267,6 @@ def _fidelity_fallback_reason(
         return "table_without_geometry"
     if block.kind == "vector" and getattr(block.vector, "complex", False):
         return "complex_vector"
-    if block.kind in _FIDELITY_TEXT_KINDS:
-        if not str(block.text or "").strip() and not block.lines:
-            return "empty_text"
-        confidence = block.confidence
-        if confidence is not None and confidence < min_confidence:
-            return f"low_confidence:{float(confidence):.3f}"
     return ""
 
 
@@ -1144,10 +1144,10 @@ def _write_header_footer_blocks(
 
 def _can_place_header_footer_item(block: IRBlock) -> bool:
     """页眉页脚块是否可以在不渲染图片的情况下重建。"""
-    if block.fallback_reason or block.fallback_image is not None:
-        return False
     if block.kind in _FIDELITY_TEXT_KINDS:
         return bool(str(block.text or "").strip() or block.lines)
+    if block.fallback_reason or block.fallback_image is not None:
+        return False
     if block.kind == "image":
         return bool(block.image_bytes)
     if block.kind == "vector":
@@ -1385,7 +1385,7 @@ def export_fidelity_docx(
     * 图片、线条、矢量对象按 bbox 锚定；
     * 表格使用固定布局 + ``w:tblpPr`` 浮动定位；
     * 页眉页脚写入 Word header/footer，失败时在正文按原坐标兜底；
-    * 低置信度或无法重建的区域渲染原区域图片兜底，并写入报告。
+    * 无法重建的非正文区域渲染原区域图片兜底，并写入报告；正文始终保留为文字。
     """
     from itertools import count
 
