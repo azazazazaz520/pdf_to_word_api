@@ -95,7 +95,9 @@ def _detect_column_boundaries(
     edges = sorted({value for interval in intervals for value in interval})
     gaps: list[tuple[float, float]] = []
     for left, right in zip(edges, edges[1:]):
-        if right - left < 18.0:
+        # 分栏留白由整栏文字让出，十几点的间距已是明显分栏；
+        # 更窄的间距属于行内字距，不作为分栏依据。
+        if right - left < 12.0:
             continue
         midpoint = (left + right) / 2.0
         if not (page_width * 0.2 <= midpoint <= page_width * 0.8):
@@ -114,13 +116,82 @@ def _detect_column_boundaries(
     return tuple(boundaries)
 
 
+def _same_visual_row(left: PdfTextLine, right: PdfTextLine) -> bool:
+    """判断两行是否属于同一视觉行。
+
+    同一行文字若被拆成多段，各段的上界会因字形高低相差一两个点，而下界
+    （基线）基本重合。仅按上界排序会把同一行靠右的字排到靠左的字前面，
+    成品因此出现姓名互换这类顺序错乱。上界或基线落在行高的一小段以内
+    即视为同一行，正文行的行距远大于该容差，不会被并入。
+    """
+    scale = max(
+        float(left.font_size or 0.0),
+        left.bottom - left.top,
+        float(right.font_size or 0.0),
+        right.bottom - right.top,
+    )
+    if scale <= 0:
+        return True
+    return (
+        abs(left.top - right.top) <= scale * 0.25
+        or abs(left.bottom - right.bottom) <= scale * 0.6
+    )
+
+
+def _row_tolerant_sort(
+    lines: list[PdfTextLine],
+) -> list[PdfTextLine]:
+    """按阅读次序排序文本行，同一视觉行内按横向次序。
+
+    直接按 ``(top, x0)`` 排序时，同行各段的上界差异（字形高低造成的
+    零点几到几个点）会成为主键，使同行靠右的文字排到靠左的文字之前，
+    成品因此出现姓名互换这类顺序错乱。这里改为先按上界扫描出视觉行，
+    行内按横向排序，再按视觉行输出。
+    """
+    ordered = sorted(lines, key=lambda line: (line.top, line.x0))
+    result: list[PdfTextLine] = []
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        while end < len(ordered) and _same_visual_row(ordered[index], ordered[end]):
+            end += 1
+        result.extend(sorted(ordered[index:end], key=lambda line: line.x0))
+        index = end
+    return result
+
+
+def _normalize_row_order(
+    lines: tuple[PdfTextLine, ...],
+) -> tuple[PdfTextLine, ...]:
+    """把同一视觉行内的文本行按横向次序排好。
+
+    输入需已按 ``(top, x0)`` 排序。同一视觉行可能由多段文字组成
+    （同一行上的多个姓名、被拆成多个文本对象的行），此时横向次序才是
+    阅读次序。分组以组内最靠上的行为基准，避免相邻比较造成连锁归并。
+    """
+    result = list(lines)
+    index = 0
+    while index < len(result):
+        end = index + 1
+        while end < len(result) and _same_visual_row(result[index], result[end]):
+            end += 1
+        if end - index > 1:
+            result[index:end] = sorted(
+                result[index:end], key=lambda line: line.x0
+            )
+        index = end
+    return tuple(result)
+
+
 def _sort_lines_in_reading_order(
     lines: tuple[PdfTextLine, ...],
     boundaries: tuple[float, ...],
     page_width: float,
 ) -> tuple[PdfTextLine, ...]:
     """按分栏边界重排文本行；跨栏标题保持在全宽位置。"""
-    ordered_lines = tuple(sorted(lines, key=lambda line: (line.top, line.x0)))
+    ordered_lines = _normalize_row_order(
+        sorted(lines, key=lambda line: (line.top, line.x0))
+    )
     if not boundaries:
         return ordered_lines
     separator_ids = {

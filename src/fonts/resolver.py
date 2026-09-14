@@ -501,25 +501,6 @@ def resolve_font(
     )
 
 
-def style_key(
-    font_name: str,
-    font_size: float,
-    color: tuple[int, int, int] | None,
-    bold: bool,
-    italic: bool,
-    rotation: float = 0.0,
-) -> tuple[Any, ...]:
-    """用于把同一行的字符切分成 font run 的比较键。"""
-    return (
-        font_name,
-        round(float(font_size) * 4) / 4,
-        tuple(color) if color else None,
-        bool(bold),
-        bool(italic),
-        round(float(rotation) / 2.0) * 2.0,
-    )
-
-
 def summarize_font_usage(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """把逐行/逐 span 的字体信息聚合成字体使用报告。"""
     usage: dict[tuple[str, str, bool, bool], dict[str, Any]] = {}

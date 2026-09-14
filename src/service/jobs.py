@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 _JOB_COLUMNS = (
     "job_id",
+    "owner_id",
     "filename",
     "workspace",
     "input_path",
@@ -71,6 +72,7 @@ class JobStore:
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
+                    owner_id TEXT,
                     filename TEXT NOT NULL,
                     workspace TEXT NOT NULL,
                     input_path TEXT NOT NULL,
@@ -101,6 +103,8 @@ class JobStore:
                 row[1]
                 for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
             }
+            if "owner_id" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN owner_id TEXT")
             if "table_count" not in columns:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN table_count INTEGER NOT NULL DEFAULT 0"

@@ -7,7 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 from collections import Counter
-from ..fonts.resolver import style_key as font_style_key
 from ..pdf_routing import normalize_page_text
 
 _PAGEOBJ_PATH = 2
@@ -294,16 +293,6 @@ class _TextCharacter:
     font_substituted: bool = False
     font_fallback_reason: str = ""
 
-    def style_key(self) -> tuple[Any, ...]:
-        return font_style_key(
-            self.font_name,
-            self.font_size,
-            self.color,
-            self.bold,
-            self.italic,
-            self.rotation,
-        )
-
     @property
     def center_x(self) -> float:
         return (self.x0 + self.x1) / 2
@@ -338,17 +327,6 @@ class _TextObjectStyle:
 
 def _compact_text(value: str) -> str:
     return normalize_page_text(value.replace("\r", "\n")).replace("\n", " ")
-
-
-def _same_text_band(left: _TextCharacter, right: _TextCharacter) -> bool:
-    overlap = min(left.bottom, right.bottom) - max(left.top, right.top)
-    minimum_height = min(left.bottom - left.top, right.bottom - right.top)
-    if overlap >= minimum_height * 0.35:
-        return True
-    return abs(left.center_y - right.center_y) <= max(
-        6.0,
-        max(left.font_size, right.font_size) * 0.6,
-    )
 
 
 def _dominant_value(values: list[Any], default: Any) -> Any:

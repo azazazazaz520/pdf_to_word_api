@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -17,6 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -112,15 +115,12 @@ class ServiceConfig:
         "PDF_SERVICE_RENDER_TEXT_COMPARE", True
     )
     ssim_threshold: float = _env_float("PDF_SERVICE_SSIM_THRESHOLD", 0.98)
-    ssim_fallback_threshold: float = _env_float(
-        "PDF_SERVICE_SSIM_FALLBACK_THRESHOLD", 0.80
-    )
     embed_pdf_fonts: bool = _env_bool("PDF_SERVICE_EMBED_PDF_FONTS", True)
     calibrate_font_metrics: bool = _env_bool(
         "PDF_SERVICE_CALIBRATE_FONT_METRICS", True
     )
     fidelity_auto_fallback: bool = _env_bool(
-        "PDF_SERVICE_FIDELITY_AUTO_FALLBACK", True
+        "PDF_SERVICE_FIDELITY_AUTO_FALLBACK", False
     )
     fidelity_fallback_dpi: float = _env_float(
         "PDF_SERVICE_FIDELITY_FALLBACK_DPI", 200.0
@@ -166,6 +166,14 @@ class ServiceConfig:
     )
     max_retries: int = _env_int("PDF_SERVICE_MAX_RETRIES", 1)
     auth_token: str = os.getenv("PDF_SERVICE_TOKEN", "")
+    supabase_url: str = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    supabase_anon_key: str = os.getenv("SUPABASE_ANON_KEY", "").strip()
+    supabase_auth_timeout_seconds: float = _env_float(
+        "PDF_SERVICE_SUPABASE_AUTH_TIMEOUT_SECONDS", 5.0
+    )
+    supabase_auth_cache_seconds: float = _env_float(
+        "PDF_SERVICE_SUPABASE_AUTH_CACHE_SECONDS", 60.0
+    )
 
     def __post_init__(self) -> None:
         if not 1 <= self.worker_processes <= 4:
@@ -198,10 +206,6 @@ class ServiceConfig:
             raise RuntimeError("环境变量 PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS 必须大于 0")
         if not 0 < self.ssim_threshold <= 1:
             raise RuntimeError("环境变量 PDF_SERVICE_SSIM_THRESHOLD 必须在 0 到 1 之间")
-        if not 0 <= self.ssim_fallback_threshold <= 1:
-            raise RuntimeError(
-                "环境变量 PDF_SERVICE_SSIM_FALLBACK_THRESHOLD 必须在 0 到 1 之间"
-            )
         if self.render_ssim_dpi <= 0:
             raise RuntimeError("环境变量 PDF_SERVICE_RENDER_SSIM_DPI 必须大于 0")
         if self.fidelity_fallback_dpi <= 0:
@@ -246,6 +250,14 @@ class ServiceConfig:
             )
         if not 0 <= self.max_retries <= 3:
             raise RuntimeError("环境变量 PDF_SERVICE_MAX_RETRIES 必须在 0 到 3 之间")
+        if self.supabase_auth_timeout_seconds <= 0:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_SUPABASE_AUTH_TIMEOUT_SECONDS 必须大于 0"
+            )
+        if self.supabase_auth_cache_seconds < 0:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_SUPABASE_AUTH_CACHE_SECONDS 不能小于 0"
+            )
 
 
 CONFIG = ServiceConfig()
@@ -268,6 +280,7 @@ class Job:
     stage_log_path: Path
     cancel_path: Path
     page_count: int
+    owner_id: str | None = None
     created_at: datetime = field(default_factory=_utc_now)
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -325,6 +338,7 @@ class Job:
         """返回可写入任务存储的标量字段。"""
         return {
             "job_id": self.job_id,
+            "owner_id": self.owner_id,
             "filename": self.filename,
             "workspace": str(self.workspace),
             "input_path": str(self.input_path),
@@ -416,6 +430,11 @@ class JobManager:
         try:
             return Job(
                 job_id=str(record["job_id"]),
+                owner_id=(
+                    str(record["owner_id"])
+                    if record.get("owner_id")
+                    else None
+                ),
                 filename=str(record["filename"]),
                 workspace=Path(str(record["workspace"])),
                 input_path=Path(str(record["input_path"])),
@@ -467,6 +486,7 @@ class JobManager:
         source_path: Path,
         page_count: int,
         *,
+        owner_id: str | None = None,
         route_mode: str | None = None,
     ) -> Job:
         selected_route_mode = route_mode or CONFIG.route_mode
@@ -496,6 +516,7 @@ class JobManager:
                 stage_log_path=stage_log_path,
                 cancel_path=cancel_path,
                 page_count=page_count,
+                owner_id=owner_id,
                 route_mode=selected_route_mode,
                 export_mode=selected_export_mode,
                 max_retries=CONFIG.max_retries,
@@ -626,7 +647,6 @@ class JobManager:
             "render_ssim_dpi": CONFIG.render_ssim_dpi,
             "render_text_compare": CONFIG.render_text_compare,
             "ssim_threshold": CONFIG.ssim_threshold,
-            "ssim_fallback_threshold": CONFIG.ssim_fallback_threshold,
             "embed_pdf_fonts": CONFIG.embed_pdf_fonts,
             "calibrate_font_metrics": CONFIG.calibrate_font_metrics,
             "font_metrics_cache": str(
@@ -898,6 +918,18 @@ class JobManager:
             LOGGER.exception("写入任务管理状态失败：%s", job.job_id)
 
 
+@dataclass(frozen=True)
+class AuthenticatedIdentity:
+    """表示通过服务令牌或 Supabase 会话校验的调用方。"""
+
+    user_id: str | None
+    is_service: bool = False
+
+
+_SUPABASE_AUTH_CACHE: dict[str, tuple[float, str]] = {}
+_SUPABASE_AUTH_CACHE_LOCK = threading.Lock()
+
+
 MANAGER: JobManager | None = None
 
 
@@ -909,14 +941,88 @@ def _get_manager() -> JobManager:
     return MANAGER
 
 
-def _require_auth(request: Request) -> None:
-    if not CONFIG.auth_token:
-        return
+def _request_token(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
     api_key = request.headers.get("x-api-key", "")
-    bearer = authorization.removeprefix("Bearer ").strip()
-    if not hmac.compare_digest(bearer or api_key, CONFIG.auth_token):
+    authorization = authorization.strip()
+    bearer = (
+        authorization[7:].strip()
+        if authorization[:7].lower() == "bearer "
+        else authorization
+    )
+    return bearer or api_key.strip()
+
+
+def _verify_supabase_token(token: str) -> str | None:
+    if not CONFIG.supabase_url or not CONFIG.supabase_anon_key:
+        return None
+
+    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    if CONFIG.supabase_auth_cache_seconds > 0:
+        with _SUPABASE_AUTH_CACHE_LOCK:
+            cached = _SUPABASE_AUTH_CACHE.get(cache_key)
+            if cached and cached[0] > now:
+                return cached[1]
+            _SUPABASE_AUTH_CACHE.pop(cache_key, None)
+
+    auth_request = UrlRequest(
+        f"{CONFIG.supabase_url}/auth/v1/user",
+        headers={
+            "Accept": "application/json",
+            "apikey": CONFIG.supabase_anon_key,
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urlopen(auth_request, timeout=CONFIG.supabase_auth_timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            return None
+        raise HTTPException(status_code=503, detail="身份服务暂时不可用") from error
+    except (URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=503, detail="身份服务暂时不可用") from error
+
+    user_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    if CONFIG.supabase_auth_cache_seconds > 0:
+        with _SUPABASE_AUTH_CACHE_LOCK:
+            _SUPABASE_AUTH_CACHE[cache_key] = (
+                now + CONFIG.supabase_auth_cache_seconds,
+                user_id,
+            )
+    return user_id
+
+
+def _require_auth(request: Request) -> AuthenticatedIdentity:
+    if not CONFIG.auth_token:
+        raise HTTPException(status_code=503, detail="服务未配置 PDF_SERVICE_TOKEN")
+
+    token = _request_token(request)
+    if not token:
         raise HTTPException(status_code=401, detail="未提供有效的服务访问凭证")
+    if hmac.compare_digest(token, CONFIG.auth_token):
+        return AuthenticatedIdentity(user_id=None, is_service=True)
+
+    user_id = _verify_supabase_token(token)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="未提供有效的服务访问凭证")
+    return AuthenticatedIdentity(user_id=user_id)
+
+
+def _get_authorized_job(
+    manager: JobManager,
+    job_id: str,
+    identity: AuthenticatedIdentity,
+) -> Job:
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if identity.user_id is not None and job.owner_id != identity.user_id:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    return job
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -1008,7 +1114,7 @@ if allowed_origins:
     )
 
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(_require_auth)])
 def health() -> dict[str, Any]:
     manager = _get_manager()
     return {
@@ -1054,10 +1160,11 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.post("/api/pdf-to-word/jobs", dependencies=[Depends(_require_auth)])
+@app.post("/api/pdf-to-word/jobs")
 async def create_job(
     file: UploadFile = File(...),
     route_mode: str | None = Form(None),
+    identity: AuthenticatedIdentity = Depends(_require_auth),
 ) -> dict[str, Any]:
     selected_route_mode = (route_mode or CONFIG.route_mode).strip().lower()
     if selected_route_mode not in ROUTE_MODES:
@@ -1065,7 +1172,6 @@ async def create_job(
             status_code=400,
             detail="route_mode 必须是 auto、text 或 ocr",
         )
-    selected_export_mode = EXPORT_MODE
     manager = _get_manager()
     manager.cleanup_expired()
     if not manager.has_capacity():
@@ -1080,8 +1186,8 @@ async def create_job(
             _safe_filename(file.filename),
             staging_path,
             page_count,
+            owner_id=identity.user_id,
             route_mode=selected_route_mode,
-            export_mode=selected_export_mode,
         )
         return job.as_dict()
     except HTTPException:
@@ -1097,19 +1203,21 @@ async def create_job(
         await file.close()
 
 
-@app.get("/api/pdf-to-word/jobs/{job_id}", dependencies=[Depends(_require_auth)])
-def get_job(job_id: str) -> dict[str, Any]:
-    job = _get_manager().get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+@app.get("/api/pdf-to-word/jobs/{job_id}")
+def get_job(
+    job_id: str,
+    identity: AuthenticatedIdentity = Depends(_require_auth),
+) -> dict[str, Any]:
+    job = _get_authorized_job(_get_manager(), job_id, identity)
     return job.as_dict()
 
 
-@app.get("/api/pdf-to-word/jobs/{job_id}/result", dependencies=[Depends(_require_auth)])
-def download_result(job_id: str) -> FileResponse:
-    job = _get_manager().get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+@app.get("/api/pdf-to-word/jobs/{job_id}/result")
+def download_result(
+    job_id: str,
+    identity: AuthenticatedIdentity = Depends(_require_auth),
+) -> FileResponse:
+    job = _get_authorized_job(_get_manager(), job_id, identity)
     if job.status != "succeeded" or not job.output_path.is_file():
         raise HTTPException(status_code=409, detail=f"任务当前状态为 {job.status}")
     return FileResponse(
@@ -1119,10 +1227,14 @@ def download_result(job_id: str) -> FileResponse:
     )
 
 
-@app.delete("/api/pdf-to-word/jobs/{job_id}", dependencies=[Depends(_require_auth)])
-def cancel_job(job_id: str) -> dict[str, Any]:
+@app.delete("/api/pdf-to-word/jobs/{job_id}")
+def cancel_job(
+    job_id: str,
+    identity: AuthenticatedIdentity = Depends(_require_auth),
+) -> dict[str, Any]:
     try:
-        job = _get_manager().cancel(job_id)
+        job = _get_authorized_job(_get_manager(), job_id, identity)
+        job = _get_manager().cancel(job.job_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="任务不存在或已过期") from error
     return job.as_dict()

@@ -3,30 +3,21 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 
-from PIL import Image
-from pypdf import PdfReader
-
+import pypdfium2 as pdfium
 
 _URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
-_SPECIAL_FONT_CHAR_MAPPING = str.maketrans(
+_SYMBOL_FONT_CHAR_MAPPING = str.maketrans(
     {
-        "\u0b35": "₁",
-        "\u0b36": "₂",
-        "\u1250": "⎧",
+        # Wingdings 私有区项目符号，字形为实心圆点与空心方块
+        "\uf06c": "•",
+        "\uf071": "❑",
         "\uf0b7": "•",
     }
 )
-_GARBLED_CHAR_RANGES = (
-    (0x2E80, 0x2FFF),
-    (0x0B00, 0x0D7F),
-    (0x1200, 0x137F),
-    (0x1D400, 0x1D7FF),
-    (0xFB00, 0xFB06),
-    (0xFFFD, 0xFFFD),
-)
+_REPLACEMENT_CHARACTERS = frozenset({"\ufffd", "\u0000"})
+_PAGE_IMAGE_OBJECT_TYPE = 3
 
 
 @dataclass(frozen=True)
@@ -120,7 +111,7 @@ def normalize_page_text(value: str | None) -> str:
         if "MATHEMATICAL" in unicodedata.name(character, "")
         else character
         for character in value
-    ).translate(_SPECIAL_FONT_CHAR_MAPPING)
+    ).translate(_SYMBOL_FONT_CHAR_MAPPING)
     lines = []
     for line in value.replace("\x00", "").splitlines():
         normalized = re.sub(r"[ \t]+", " ", line).strip()
@@ -129,25 +120,46 @@ def normalize_page_text(value: str | None) -> str:
     return "\n".join(lines)
 
 
+def _read_page_text(value: str | None) -> str:
+    """归一化页面文本用于文本层判定，兼容字符按 Unicode 标准映射折叠。"""
+    if not value:
+        return ""
+    return normalize_page_text(unicodedata.normalize("NFKC", value))
+
+
 def count_text_characters(value: str) -> int:
     """统计去除空白后的文本字符数量。"""
     return len(re.sub(r"\s+", "", value))
 
 
-def _count_garbled_characters(value: str) -> int:
-    return sum(
-        any(start <= ord(character) <= end for start, end in _GARBLED_CHAR_RANGES)
-        for character in value
+def _is_suspicious_character(character: str) -> bool:
+    """判断字符是否为无法确认语义的异常字形。"""
+    return (
+        character in _REPLACEMENT_CHARACTERS
+        or unicodedata.category(character) == "Co"
     )
 
 
-def _image_dimensions(image: object) -> tuple[int, int] | None:
+def _count_garbled_characters(value: str) -> int:
+    return sum(_is_suspicious_character(character) for character in value)
+
+
+def _page_image_sizes(page: object) -> list[tuple[int, int]]:
+    """返回页面内所有图像对象的固有像素尺寸。"""
+    sizes = []
     try:
-        data = getattr(image, "data")
-        with Image.open(BytesIO(data)) as decoded:
-            return decoded.width, decoded.height
+        objects = list(page.get_objects())
     except Exception:
-        return None
+        return sizes
+    for item in objects:
+        if item.type != _PAGE_IMAGE_OBJECT_TYPE:
+            continue
+        try:
+            width, height = item.get_px_size()
+        except Exception:
+            continue
+        sizes.append((int(width), int(height)))
+    return sizes
 
 
 def _is_full_page_image(
@@ -172,32 +184,22 @@ def _analyze_page(
     full_page_image_min_pixels: int,
     garbled_char_ratio_threshold: float,
 ) -> PdfPageTextAnalysis:
-    text = normalize_page_text(page.extract_text())
+    text = _read_page_text(page.get_textpage().get_text_range())
     text_char_count = count_text_characters(text)
     garbled_char_count = _count_garbled_characters(text)
     url_count = len(_URL_PATTERN.findall(text))
-    image_count = 0
+    page_width, page_height = page.get_size()
+    image_sizes = _page_image_sizes(page)
+    image_count = len(image_sizes)
     full_page_image_count = 0
     max_image_pixels = 0
-    page_width = float(page.mediabox.width)
-    page_height = float(page.mediabox.height)
-    try:
-        images = list(page.images)
-    except Exception:
-        images = []
-    image_count = len(images)
-    for image in images:
-        dimensions = _image_dimensions(image)
-        if dimensions is None:
-            continue
-        width, height = dimensions
-        pixels = width * height
-        max_image_pixels = max(max_image_pixels, pixels)
+    for width, height in image_sizes:
+        max_image_pixels = max(max_image_pixels, width * height)
         if _is_full_page_image(
             width,
             height,
-            page_width=page_width,
-            page_height=page_height,
+            page_width=float(page_width),
+            page_height=float(page_height),
             min_pixels=full_page_image_min_pixels,
         ):
             full_page_image_count += 1
@@ -208,9 +210,8 @@ def _analyze_page(
     if full_page_image_count:
         quality_score -= 0.45
     if garbled_char_count:
-        quality_score -= 0.35
-    if garbled_char_count / max(text_char_count, 1) > garbled_char_ratio_threshold:
-        quality_score -= 0.25
+        garbled_char_ratio = garbled_char_count / max(text_char_count, 1)
+        quality_score -= 0.35 * min(1.0, garbled_char_ratio / garbled_char_ratio_threshold)
     url_char_count = sum(len(match.group(0)) for match in _URL_PATTERN.finditer(text))
     if url_char_count / max(text_char_count, 1) > 0.25:
         quality_score -= 0.15
@@ -244,7 +245,7 @@ def analyze_pdf_text(
     if not 0 <= garbled_char_ratio_threshold <= 1:
         raise ValueError("异常字形比例阈值必须在 0 到 1 之间")
 
-    reader = PdfReader(str(path))
+    document = pdfium.PdfDocument(str(path))
     page_texts: list[str] = []
     pages: list[PdfPageTextAnalysis] = []
     usable_page_count = 0
@@ -252,23 +253,26 @@ def analyze_pdf_text(
     text_char_count = 0
     full_page_image_page_count = 0
     garbled_char_count = 0
-    for page in reader.pages:
-        page_analysis = _analyze_page(
-            page,
-            min_page_chars=min_page_chars,
-            full_page_image_min_pixels=full_page_image_min_pixels,
-            garbled_char_ratio_threshold=garbled_char_ratio_threshold,
-        )
-        pages.append(page_analysis)
-        page_texts.append(page_analysis.text)
-        text_char_count += page_analysis.text_char_count
-        garbled_char_count += page_analysis.garbled_char_count
-        if page_analysis.text_char_count >= min_page_chars:
-            usable_page_count += 1
-        if page_analysis.is_high_quality(min_page_chars=min_page_chars):
-            high_quality_page_count += 1
-        if page_analysis.full_page_image_count:
-            full_page_image_page_count += 1
+    try:
+        for page in document:
+            page_analysis = _analyze_page(
+                page,
+                min_page_chars=min_page_chars,
+                full_page_image_min_pixels=full_page_image_min_pixels,
+                garbled_char_ratio_threshold=garbled_char_ratio_threshold,
+            )
+            pages.append(page_analysis)
+            page_texts.append(page_analysis.text)
+            text_char_count += page_analysis.text_char_count
+            garbled_char_count += page_analysis.garbled_char_count
+            if page_analysis.text_char_count >= min_page_chars:
+                usable_page_count += 1
+            if page_analysis.is_high_quality(min_page_chars=min_page_chars):
+                high_quality_page_count += 1
+            if page_analysis.full_page_image_count:
+                full_page_image_page_count += 1
+    finally:
+        document.close()
 
     return PdfTextAnalysis(
         page_texts=page_texts,

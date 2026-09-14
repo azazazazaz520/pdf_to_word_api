@@ -145,8 +145,11 @@ def _run_render_validation(
     font_usage_report: dict[str, Any],
     font_plan_report: dict[str, Any] | None,
     font_metrics_report: dict[str, Any] | None,
-) -> None:
-    """渲染回读、保真验收与整页图片兜底，结果写回 quality。
+) -> dict[str, Any]:
+    """渲染回读、保真验收与整页图片兜底。
+
+    整页兜底会改写 IR 的页面路由与可编辑状态，因此需要按兜底后的 IR
+    重建质量报告并返回给调用方；仅在函数内重新绑定局部变量不会影响调用方。
 
     由调用方按 render_validation 开关决定是否执行；渲染失败只记录告警。
     """
@@ -204,17 +207,6 @@ def _run_render_validation(
                 acceptance["toc_extra_pages"] = toc_extra_pages
                 quality["fidelity_acceptance"] = acceptance
             auto_fallback_pages: list[int] = []
-            # 只有"明显不同"的页面才贴图；SSIM 未达标但内容已对齐的页面保留可编辑文本
-            fallback_threshold = float(
-                payload.get("ssim_fallback_threshold", 0.80)
-            )
-            quality["fidelity_fallback_threshold"] = fallback_threshold
-            per_page_ssim = {
-                int(item.get("page") or 0): float(item.get("ssim") or 0.0)
-                for item in (
-                    (render_result.get("ssim") or {}).get("per_page_ssim") or []
-                )
-            }
             layout_pages = {
                 int(item.get("page") or 0): item
                 for item in (
@@ -230,22 +222,21 @@ def _run_render_validation(
             coverage_threshold = float(
                 payload.get("coverage_fallback_threshold", 0.90)
             )
+            quality["fidelity_fallback_threshold"] = coverage_threshold
             candidates = []
-            for page_number, score in per_page_ssim.items():
+            for page_number, coverage in coverage_pages.items():
                 if not 1 <= page_number <= len(ir.pages):
                     continue
                 page = ir.pages[page_number - 1]
                 if page.route in {"page_image", "blank"}:
                     # 本来就是整页图片/空白页，无需再兜底
                     continue
-                coverage = coverage_pages.get(page_number, 1.0)
-                # 只有"内容确实丢失/明显不同"才贴图：SSIM 过低或文字覆盖率不足
-                if score < fallback_threshold:
-                    candidates.append(page_number)
-                elif coverage < coverage_threshold:
+                # 只依据文字丢失程度贴图；图像相似度不参与判定
+                if coverage < coverage_threshold:
                     candidates.append(page_number)
             candidates.sort()
-            if not bool(payload.get("fidelity_auto_fallback", True)):
+            # 默认不生成兜底整页图片：文字缺失应由导出修正，而不是用截图掩盖
+            if not bool(payload.get("fidelity_auto_fallback", False)):
                 candidates = []
             auto_fallback_pages: list[int] = []
             if candidates:
@@ -263,7 +254,7 @@ def _run_render_validation(
                     "fidelity_auto_fallback_started",
                     progress=98,
                     route=route,
-                    route_reason="ssim_below_threshold",
+                    route_reason="text_coverage_below_threshold",
                     pages=auto_fallback_pages,
                 )
                 export_fidelity_docx(
@@ -365,6 +356,7 @@ def _run_render_validation(
                 elapsed_sec=round(time.perf_counter() - render_started, 3),
                 error=f"{type(error).__name__}: {error}",
             )
+    return quality
 
 
 def process_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -868,7 +860,6 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             font_programs=font_programs,
             stage_callback=emit_export_stage,
         )
-        quality = ir.quality_report(compact=page_count > 200)
         quality["fidelity"] = fidelity_report
         font_usage_report = ir.font_usage()
         font_plan_report = font_plan.report() if font_plan is not None else None
@@ -891,7 +882,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             needs_review_pages=quality.get("needs_review_pages", []),
         )
         if bool(payload.get("render_validation", False)):
-            _run_render_validation(
+            quality = _run_render_validation(
                 payload,
                 quality,
                 ir=ir,

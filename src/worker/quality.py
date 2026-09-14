@@ -12,6 +12,9 @@ from ..ir.model import IRBlock, IRDocument, IRWarning
 from ..export.document_setup import render_page_image_png
 from ..page_render import render_page_image
 
+# 整页贴图的触发依据：该页渲染后文字覆盖率不足，即内容确实丢失
+_PAGE_IMAGE_FALLBACK_REASON = "auto_fallback_text_coverage_below_threshold"
+
 
 def _append_quality_warning(
     quality: dict[str, Any],
@@ -271,7 +274,7 @@ def _apply_page_image_fallback(
                 bbox=(0.0, 0.0, page.width, page.height),
                 layer="background",
                 confidence=1.0,
-                fallback_reason="auto_fallback_ssim_below_threshold",
+                fallback_reason=_PAGE_IMAGE_FALLBACK_REASON,
             )
         ]
         page.route = "page_image"
@@ -280,14 +283,14 @@ def _apply_page_image_fallback(
         page.fidelity = {
             "rebuild_confidence": 0.8,
             "force_page_image": True,
-            "force_page_image_reason": "auto_fallback_ssim_below_threshold",
+            "force_page_image_reason": _PAGE_IMAGE_FALLBACK_REASON,
             "page_image_fallback": True,
             "fallback_regions": [
                 {
                     "kind": "page_image",
                     "layer": "background",
                     "bbox": [0.0, 0.0, round(page.width, 2), round(page.height, 2)],
-                    "reason": "auto_fallback_ssim_below_threshold",
+                    "reason": _PAGE_IMAGE_FALLBACK_REASON,
                 }
             ],
             "native_block_count": 0,

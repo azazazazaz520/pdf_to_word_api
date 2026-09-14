@@ -64,7 +64,7 @@ $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = 'True'
 
 ## 第一版服务器服务
 
-服务文件为 `src\pdf_to_word_service.py`，默认先分析 PDF 文本层和页面图像：文本层完整的文字型 PDF 走布局感知文本路线；存在但不完整的文本层走原始页面保真路线；没有可用文本层的文件使用默认的 `structure-lite` OCR 快速路线。布局感知文本路线会按页面坐标恢复阅读顺序，识别矢量表格并生成真实 Word 表格，同时恢复常见标题和列表结构。API 进程只负责任务接入和状态查询，实际转换交给可独立终止的 worker 进程；任务状态持久化在 `service_data\jobs.sqlite3`，任务文件保存在 `service_data\jobs`，过期任务按 TTL 清理。
+服务文件为 `src\service\app.py`，默认先分析 PDF 文本层和页面图像：文本层完整的文字型 PDF 走布局感知文本路线；存在但不完整的文本层走原始页面保真路线；没有可用文本层的文件使用默认的 `structure-lite` OCR 快速路线。布局感知文本路线会按页面坐标恢复阅读顺序，识别矢量表格并生成真实 Word 表格，同时恢复常见标题和列表结构。API 进程只负责任务接入和状态查询，实际转换交给可独立终止的 worker 进程；任务状态持久化在 `service_data\jobs.sqlite3`，任务文件保存在 `service_data\jobs`，过期任务按 TTL 清理。
 
 安装服务依赖后启动：
 
@@ -72,7 +72,9 @@ $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = 'True'
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = 'True'
 $env:PDF_SERVICE_TOKEN = '请替换为随机长令牌'
-& .\.venv\Scripts\python.exe -m src.pdf_to_word_service
+$env:SUPABASE_URL = '与 Prism 的 VITE_SUPABASE_URL 相同'
+$env:SUPABASE_ANON_KEY = '与 Prism 的 VITE_SUPABASE_ANON_KEY 相同'
+& .\.venv\Scripts\python.exe -m src.service.app
 ```
 
 默认仅监听 `127.0.0.1:8765`。部署到服务器时，应通过防火墙或反向代理限制访问范围；确需局域网访问时再设置 `PDF_SERVICE_HOST=0.0.0.0`，并保留 `PDF_SERVICE_TOKEN`。当前服务已将任务状态写入 SQLite，并由独立监管线程负责 worker 调度、超时终止和失败重试；正式多实例部署前仍需接入共享 Redis/数据库队列，并完成反向代理安全配置。
@@ -86,6 +88,8 @@ GET    /api/pdf-to-word/jobs/{job_id}
 GET    /api/pdf-to-word/jobs/{job_id}/result
 DELETE /api/pdf-to-word/jobs/{job_id}
 ```
+
+Prism 客户端使用 Supabase 匿名会话产生的短期 JWT 调用上述接口；PDF_SERVICE_TOKEN 仅保留在服务端环境中，也可用于服务端管理调用。
 
 环境变量：
 
@@ -101,7 +105,11 @@ DELETE /api/pdf-to-word/jobs/{job_id}
 - 转换模式固定为 `fidelity`：一页一个 section，可重建内容按源坐标绝对定位，无法重建的区域贴原区域图片；不再提供 `hybrid`、`flow`、`text` 等运行期模式选择，也没有对应的环境变量。
 - `PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS`：整页图像像素上限，默认 4194304。
 - `PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY`：混合模式页面图像 JPEG 质量，默认 88。
-- `PDF_SERVICE_TOKEN`：配置后要求 `Authorization: Bearer <token>` 或 `X-API-Key`。
+- `PDF_SERVICE_TOKEN`：服务端长期内部令牌，必须配置；仍支持使用该令牌进行服务端管理调用。
+- `SUPABASE_URL`：Prism 使用的 Supabase 项目地址。配置后，PDF API 接受 Prism 匿名登录产生的短期 JWT。
+- `SUPABASE_ANON_KEY`：对应 Supabase 项目的匿名公钥，用于服务端调用 `/auth/v1/user` 校验客户端 JWT。
+- `PDF_SERVICE_SUPABASE_AUTH_TIMEOUT_SECONDS`：Supabase 身份校验超时时间，默认 5 秒。
+- `PDF_SERVICE_SUPABASE_AUTH_CACHE_SECONDS`：JWT 身份缓存时间，默认 60 秒。
 - `PDF_SERVICE_DATA_ROOT`：任务临时目录根路径。
 - `PDF_SERVICE_MAX_UPLOAD_BYTES`：默认 50 MiB。
 - `PDF_SERVICE_MAX_PAGES`：默认 100 页。

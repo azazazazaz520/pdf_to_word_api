@@ -1497,7 +1497,7 @@ def export_fidelity_docx(
             if forced_page_image:
                 page_image_fallback_reason = str(
                     page.fidelity.get("force_page_image_reason")
-                    or "auto_fallback_ssim_below_threshold"
+                    or "auto_fallback_text_coverage_below_threshold"
                 )
             elif page.route == "ocr":
                 page_image_fallback_reason = "ocr_page_preserved_as_image"

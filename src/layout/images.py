@@ -66,6 +66,15 @@ def _encode_image_bytes(
     return output.getvalue(), "image/png"
 
 
+def _has_docx_readable_jpeg_header(jpeg_data: bytes) -> bool:
+    """判断 JPEG 是否符合 DOCX 图像识别所要求的头部。
+
+    DOCX 写入库仅按 JFIF 与 Exif 两种标记识别 JPEG，
+    以 APP14 等其他标记开头的 JPEG 必须重新编码后再写入。
+    """
+    return jpeg_data[6:10] in {b"JFIF", b"Exif"}
+
+
 def _image_bytes_from_object(
     image_object: Any,
     *,
@@ -73,7 +82,7 @@ def _image_bytes_from_object(
     png_optimize: bool,
     jpeg_quality: int,
 ) -> tuple[bytes, str] | None:
-    """提取图片对象；原始 JPEG 尽量直通，其他图片按特征编码。"""
+    """提取图片对象；DOCX 可识别的原始 JPEG 直通，其他图片按特征编码。"""
     try:
         filters = image_object.get_filters(skip_simple=True)
     except Exception:
@@ -83,8 +92,10 @@ def _image_bytes_from_object(
             jpeg_data = bytes(image_object.get_data(decode_simple=True))
         except Exception:
             jpeg_data = b""
-        if jpeg_data.startswith(b"\xff\xd8") and jpeg_data.endswith(
-            b"\xff\xd9"
+        if (
+            jpeg_data.startswith(b"\xff\xd8")
+            and jpeg_data.endswith(b"\xff\xd9")
+            and _has_docx_readable_jpeg_header(jpeg_data)
         ):
             try:
                 px_size = image_object.get_px_size()
