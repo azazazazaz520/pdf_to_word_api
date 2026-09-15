@@ -234,6 +234,12 @@ class IRBlock:
     latex: str = ""
     fallback_image: bytes | None = None
     fallback_reason: str = ""
+    block_id: str = ""
+    block_type: str = ""
+    reading_order: int = -1
+    parent_id: str | None = None
+    region_id: str = ""
+    needs_review: bool = False
 
     @property
     def is_text(self) -> bool:
@@ -306,6 +312,12 @@ class IRBlock:
             "line_count": len(self.lines),
             "fallback_reason": self.fallback_reason,
             "has_fallback_image": self.fallback_image is not None,
+            "block_id": self.block_id,
+            "block_type": self.block_type,
+            "reading_order": self.reading_order,
+            "parent_id": self.parent_id,
+            "region_id": self.region_id,
+            "needs_review": self.needs_review,
         }
 
 
@@ -324,6 +336,8 @@ class IRPage:
     reconstruction_confidence: float | None = None
     fidelity: dict[str, Any] = field(default_factory=dict)
     header_footer_native: bool = False
+    reading_order_confidence: float | None = None
+    reading_order_warnings: list[str] = field(default_factory=list)
 
     def add_warning(self, warning: IRWarning) -> None:
         self.warnings.append(warning)
@@ -637,6 +651,11 @@ class IRDocument:
             for warning in page.warnings:
                 if warning.severity in {"warning", "error"}:
                     needs_review_pages.add(page.page_number)
+            if page.reading_order_warnings or (
+                page.reading_order_confidence is not None
+                and page.reading_order_confidence < 0.7
+            ):
+                needs_review_pages.add(page.page_number)
             page_results.append(
                 {
                     "page": page.page_number,
@@ -654,6 +673,8 @@ class IRDocument:
                     "vector_count": page.vector_count,
                     "fallback_block_count": len(page.fallback_blocks),
                     "rebuild_confidence": page.reconstruction_confidence,
+                    "reading_order_confidence": page.reading_order_confidence,
+                    "reading_order_warnings": list(page.reading_order_warnings),
                     "warnings": page_warnings,
                 }
             )

@@ -13,7 +13,12 @@ from .model import (
     IRTextSpan,
     IRWarning,
 )
-from ..layout.models import PdfDocumentLayout, PdfPageLayout, PdfTextLine
+from ..layout.models import (
+    PdfContentBlock,
+    PdfDocumentLayout,
+    PdfPageLayout,
+    PdfTextLine,
+)
 from ..export.content import (
     _group_text_lines,
     _layout_lines_to_text,
@@ -77,6 +82,32 @@ def _text_block(
         source=source,
         confidence=confidence,
     )
+
+
+def _apply_content_metadata(
+    block: IRBlock,
+    content_block: PdfContentBlock | None,
+    *,
+    suffix: str = "",
+) -> None:
+    """把版面阶段确定的块信息传给 IR，供导出和质量报告使用。"""
+    if content_block is None:
+        return
+    block.block_id = (
+        f"{content_block.block_id}:{suffix}"
+        if suffix
+        else content_block.block_id
+    )
+    block.block_type = content_block.block_type
+    block.reading_order = content_block.reading_order
+    block.parent_id = content_block.parent_id
+    block.region_id = content_block.region_id
+    block.needs_review = content_block.needs_review
+    block.meta["source_block_id"] = content_block.block_id
+    block.meta["reading_order"] = content_block.reading_order
+    block.meta["region_id"] = content_block.region_id
+    if content_block.needs_review:
+        block.meta["reading_order_needs_review"] = True
 
 
 def _dominant(values: Iterable[Any], default: Any) -> Any:
@@ -247,6 +278,18 @@ def build_text_page_ir(
                 severity="info",
             )
         )
+    for message in page.reading_order_warnings:
+        warnings.append(
+            IRWarning(
+                code="reading_order_uncertain",
+                message=message,
+                page=page_number,
+                severity="warning",
+                meta={
+                    "confidence": page.reading_order_confidence,
+                },
+            )
+        )
     result = IRPage(
         page_number=page_number,
         width=page.width,
@@ -255,6 +298,8 @@ def build_text_page_ir(
         confidence=confidence,
         warnings=warnings,
         editable=True,
+        reading_order_confidence=page.reading_order_confidence,
+        reading_order_warnings=list(page.reading_order_warnings),
     )
 
     body_lines = [line for line in page.lines if not line.is_header_footer]
@@ -264,41 +309,13 @@ def build_text_page_ir(
         if not any(_line_is_in_pdf_table(line, table) for table in page.tables)
     ]
     body_left = _typical_body_left(body_candidates)
-    events: list[tuple[float, int, str, Any]] = []
-    for table in page.tables:
-        events.append((table.bbox[1], 0, "table", table))
-    for image in page.images:
-        events.append((image.bbox[1], 1, "image", image))
-    if fidelity:
-        for vector in page.vectors:
-            events.append((vector.bbox[1], 1, "vector", vector))
-    geometry_blocks = tuple(getattr(page, "text_blocks", ()) or ())
-    if geometry_blocks:
-        for text_block in geometry_blocks:
-            block_lines = [
-                line
-                for line in text_block.lines
-                if not line.is_header_footer
-                and not any(
-                    _line_is_in_pdf_table(line, table)
-                    for table in page.tables
-                )
-            ]
-            if block_lines:
-                events.append(
-                    (block_lines[0].top, 2, "text_block", block_lines)
-                )
-    else:
-        for line in body_lines:
-            if not any(_line_is_in_pdf_table(line, table) for table in page.tables):
-                events.append((line.top, 2, "line", line))
-    events.sort(key=lambda item: (item[0], item[1]))
-
-    text_lines = []
     document_start_pending = is_document_start
 
-    def flush_text() -> None:
-        nonlocal document_start_pending, text_lines
+    def append_text_lines(
+        text_lines: list[PdfTextLine],
+        content_block: PdfContentBlock | None = None,
+    ) -> None:
+        nonlocal document_start_pending
         if not text_lines:
             return
         content, line_roles = _layout_lines_to_text(
@@ -315,12 +332,25 @@ def build_text_page_ir(
         )
         for position, (role, block_text) in enumerate(grouped):
             kind = _role_to_kind(role)
+            if content_block is not None:
+                if content_block.block_type == "FORMULA" and kind == "paragraph":
+                    kind = "formula"
+                elif content_block.block_type == "CAPTION" and kind == "paragraph":
+                    kind = "caption"
+                elif content_block.block_type == "TITLE" and kind == "paragraph":
+                    kind = "title" if document_start_pending else "heading1"
             block = _text_block(
                 kind=kind,
                 page_number=page_number,
                 text=block_text,
                 source="text_layout",
                 confidence=confidence,
+                bbox=(content_block.bbox if content_block else None),
+            )
+            _apply_content_metadata(
+                block,
+                content_block,
+                suffix=(str(position) if len(grouped) > 1 else ""),
             )
             span = spans[position] if position < len(spans) else ()
             source_lines = [
@@ -344,63 +374,133 @@ def build_text_page_ir(
                 block.z_order = line.z_order
             result.blocks.append(block)
         document_start_pending = False
-        text_lines = []
 
-    for _, _, kind, item in events:
-        if kind == "line":
-            text_lines.append(item)
-            continue
-        if kind == "text_block":
-            text_lines.extend(item)
-            flush_text()
-            continue
-        flush_text()
-        if kind == "table":
-            result.blocks.append(
-                IRBlock(
-                    kind="table",
-                    page=page_number,
-                    table=item,
-                    bbox=item.bbox,
-                    source="vector_table",
-                    confidence=confidence,
-                    z_order=getattr(item, "z_order", 0),
-                )
-            )
-        elif kind == "image":
-            result.blocks.append(
-                IRBlock(
-                    kind="image",
-                    page=page_number,
-                    bbox=item.bbox,
-                    source="embedded_image",
-                    image_bytes=item.data,
-                    image_width=item.width,
-                    image_height=item.height,
-                    image_alt=item.name,
-                    confidence=confidence,
-                    z_order=getattr(item, "z_order", 0),
-                    layer=getattr(item, "layer", "body"),
-                    meta={
-                        "page_width": page.width,
-                        "is_logo": getattr(item, "is_logo", False),
-                    },
-                )
-            )
-        elif kind == "vector":
-            result.blocks.append(
-                IRBlock(
-                    kind="vector",
-                    page=page_number,
-                    bbox=item.bbox,
-                    source="pdf_vector",
-                    confidence=confidence,
-                    z_order=getattr(item, "z_order", 0),
-                    layer=getattr(item, "layer", "body"),
-                    vector=item,
-                )
-            )
-    flush_text()
+    def append_table(
+        table: Any,
+        content_block: PdfContentBlock | None = None,
+    ) -> None:
+        block = IRBlock(
+            kind="table",
+            page=page_number,
+            table=table,
+            bbox=table.bbox,
+            source="vector_table",
+            confidence=confidence,
+            z_order=getattr(table, "z_order", 0),
+        )
+        _apply_content_metadata(block, content_block)
+        result.blocks.append(block)
+
+    def append_image(
+        image: Any,
+        content_block: PdfContentBlock | None = None,
+    ) -> None:
+        block = IRBlock(
+            kind="image",
+            page=page_number,
+            bbox=image.bbox,
+            source="embedded_image",
+            image_bytes=image.data,
+            image_width=image.width,
+            image_height=image.height,
+            image_alt=image.name,
+            confidence=confidence,
+            z_order=getattr(image, "z_order", 0),
+            layer=getattr(image, "layer", "body"),
+            meta={
+                "page_width": page.width,
+                "is_logo": getattr(image, "is_logo", False),
+            },
+        )
+        _apply_content_metadata(block, content_block)
+        result.blocks.append(block)
+
+    def append_vector(
+        vector: Any,
+        content_block: PdfContentBlock | None = None,
+    ) -> None:
+        block = IRBlock(
+            kind="vector",
+            page=page_number,
+            bbox=vector.bbox,
+            source="pdf_vector",
+            confidence=confidence,
+            z_order=getattr(vector, "z_order", 0),
+            layer=getattr(vector, "layer", "body"),
+            vector=vector,
+        )
+        _apply_content_metadata(block, content_block)
+        result.blocks.append(block)
+
+    content_blocks = tuple(getattr(page, "content_blocks", ()) or ())
+    if content_blocks:
+        for content_block in content_blocks:
+            if content_block.layer in {"header", "footer"}:
+                continue
+            if content_block.text_block is not None:
+                block_lines = [
+                    line
+                    for line in content_block.text_block.lines
+                    if not line.is_header_footer
+                    and not any(
+                        _line_is_in_pdf_table(line, table)
+                        for table in page.tables
+                    )
+                ]
+                append_text_lines(block_lines, content_block)
+            elif content_block.table is not None:
+                append_table(content_block.table, content_block)
+            elif content_block.image is not None:
+                append_image(content_block.image, content_block)
+            elif content_block.vector is not None and fidelity:
+                append_vector(content_block.vector, content_block)
+    else:
+        events: list[tuple[float, int, str, Any]] = []
+        for table in page.tables:
+            events.append((table.bbox[1], 0, "table", table))
+        for image in page.images:
+            events.append((image.bbox[1], 1, "image", image))
+        if fidelity:
+            for vector in page.vectors:
+                events.append((vector.bbox[1], 1, "vector", vector))
+        geometry_blocks = tuple(getattr(page, "text_blocks", ()) or ())
+        if geometry_blocks:
+            for text_block in geometry_blocks:
+                block_lines = [
+                    line
+                    for line in text_block.lines
+                    if not line.is_header_footer
+                    and not any(
+                        _line_is_in_pdf_table(line, table)
+                        for table in page.tables
+                    )
+                ]
+                if block_lines:
+                    events.append(
+                        (block_lines[0].top, 2, "text_block", block_lines)
+                    )
+        else:
+            for line in body_lines:
+                if not any(_line_is_in_pdf_table(line, table) for table in page.tables):
+                    events.append((line.top, 2, "line", line))
+        events.sort(key=lambda item: (item[0], item[1]))
+        text_lines: list[PdfTextLine] = []
+        for _, _, kind, item in events:
+            if kind == "line":
+                text_lines.append(item)
+                continue
+            if kind == "text_block":
+                append_text_lines(item)
+                continue
+            append_text_lines(text_lines)
+            text_lines = []
+            if kind == "table":
+                append_table(item)
+            elif kind == "image":
+                append_image(item)
+            elif kind == "vector":
+                append_vector(item)
+        append_text_lines(text_lines)
 
     if fidelity and keep_header_footer:
         _append_header_footer_blocks(
@@ -431,6 +531,12 @@ def _append_header_footer_blocks(
     confidence: float | None = None,
 ) -> None:
     """把页眉页脚文本、logo 和分隔线整理成独立层块。"""
+    line_sources = {
+        id(line): content_block
+        for content_block in page.content_blocks
+        if content_block.text_block is not None
+        for line in content_block.text_block.lines
+    }
     for line in page.lines:
         if not line.is_header_footer:
             continue
@@ -441,6 +547,7 @@ def _append_header_footer_blocks(
             source="header_footer_text",
             confidence=confidence,
         )
+        _apply_content_metadata(block, line_sources.get(id(line)))
         _apply_fidelity_style(
             block,
             [line],
@@ -452,37 +559,53 @@ def _append_header_footer_blocks(
     for image in page.images:
         if image.layer == "body":
             continue
-        page_ir.blocks.append(
-            IRBlock(
-                kind="image",
-                page=page_number,
-                bbox=image.bbox,
-                source="header_footer_image",
-                image_bytes=image.data,
-                image_width=image.width,
-                image_height=image.height,
-                image_alt=image.name,
-                z_order=image.z_order,
-                layer=image.layer,
-                confidence=confidence,
-                meta={"page_width": page.width, "is_logo": image.is_logo},
-            )
+        block = IRBlock(
+            kind="image",
+            page=page_number,
+            bbox=image.bbox,
+            source="header_footer_image",
+            image_bytes=image.data,
+            image_width=image.width,
+            image_height=image.height,
+            image_alt=image.name,
+            z_order=image.z_order,
+            layer=image.layer,
+            confidence=confidence,
+            meta={"page_width": page.width, "is_logo": image.is_logo},
         )
+        content_block = next(
+            (
+                item
+                for item in page.content_blocks
+                if item.image is image
+            ),
+            None,
+        )
+        _apply_content_metadata(block, content_block)
+        page_ir.blocks.append(block)
     for vector in page.vectors:
         if vector.layer == "body":
             continue
-        page_ir.blocks.append(
-            IRBlock(
-                kind="vector",
-                page=page_number,
-                bbox=vector.bbox,
-                source="header_footer_vector",
-                z_order=vector.z_order,
-                layer=vector.layer,
-                vector=vector,
-                confidence=confidence,
-            )
+        block = IRBlock(
+            kind="vector",
+            page=page_number,
+            bbox=vector.bbox,
+            source="header_footer_vector",
+            z_order=vector.z_order,
+            layer=vector.layer,
+            vector=vector,
+            confidence=confidence,
         )
+        content_block = next(
+            (
+                item
+                for item in page.content_blocks
+                if item.vector is vector
+            ),
+            None,
+        )
+        _apply_content_metadata(block, content_block)
+        page_ir.blocks.append(block)
 
 
 def _formula_latex(text: str) -> str:

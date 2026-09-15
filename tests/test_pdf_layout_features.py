@@ -9,10 +9,167 @@ from PIL import Image
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
+from src.ir.builder import build_document_ir
 from src.layout.layout import extract_pdf_layout
 
 
 class PdfLayoutFeaturesTest(unittest.TestCase):
+    def test_content_blocks_drive_ir_order_for_text_and_image(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image_path = root / "figure.png"
+            pdf_path = root / "content-order.pdf"
+            Image.new("RGB", (120, 60), color=(30, 100, 170)).save(image_path)
+
+            canvas = Canvas(str(pdf_path), pagesize=(420, 600))
+            canvas.setFont("Helvetica", 11)
+            canvas.drawString(40, 540, "Paragraph before figure")
+            canvas.drawImage(
+                ImageReader(str(image_path)),
+                120,
+                350,
+                width=120,
+                height=60,
+            )
+            canvas.setFont("Helvetica", 9)
+            canvas.drawString(145, 330, "Figure 1 caption")
+            canvas.setFont("Helvetica", 11)
+            canvas.drawString(40, 260, "Paragraph after figure")
+            canvas.save()
+
+            layout = extract_pdf_layout(pdf_path, include_fidelity=True)
+            page = layout.pages[0]
+            content_types = [block.block_type for block in page.content_blocks]
+            self.assertIn("IMAGE", content_types)
+            self.assertIn("CAPTION", content_types)
+            self.assertFalse(page.reading_order_warnings)
+            caption_block = next(
+                block
+                for block in page.content_blocks
+                if block.block_type == "CAPTION"
+            )
+            image_block = next(
+                block
+                for block in page.content_blocks
+                if block.block_type == "IMAGE"
+            )
+            self.assertEqual(caption_block.parent_id, image_block.block_id)
+            document = build_document_ir(
+                source_pdf=pdf_path,
+                page_routes=["text"],
+                page_sizes=[(page.width, page.height)],
+                layout=layout,
+                fidelity=True,
+            )
+            blocks = document.pages[0].body_blocks
+            text_positions = {
+                value: next(
+                    index
+                    for index, block in enumerate(blocks)
+                    if value in block.text
+                )
+                for value in (
+                    "Paragraph before figure",
+                    "Figure 1 caption",
+                    "Paragraph after figure",
+                )
+            }
+            image_position = next(
+                index for index, block in enumerate(blocks) if block.kind == "image"
+            )
+
+            self.assertLess(
+                text_positions["Paragraph before figure"],
+                image_position,
+            )
+            self.assertLess(image_position, text_positions["Figure 1 caption"])
+            self.assertLess(
+                text_positions["Figure 1 caption"],
+                text_positions["Paragraph after figure"],
+            )
+            self.assertTrue(all(block.block_id for block in blocks))
+            self.assertTrue(
+                all("reading_order" in block.meta for block in blocks)
+            )
+
+    def test_short_cross_column_heading_splits_local_columns(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            pdf_path = Path(temporary_directory) / "local-columns.pdf"
+            canvas = Canvas(str(pdf_path), pagesize=(600, 800))
+            canvas.setFont("Helvetica", 10)
+            for index, y in enumerate((700, 686, 672, 658)):
+                canvas.drawString(60, y, f"Left section one line {index}")
+                canvas.drawString(360, y, f"Right section one line {index}")
+            canvas.setFont("Helvetica-Bold", 14)
+            canvas.drawCentredString(300, 570, "Section 2")
+            canvas.setFont("Helvetica", 10)
+            for index, y in enumerate((540, 526, 512, 498)):
+                canvas.drawString(60, y, f"Left section two line {index}")
+                canvas.drawString(360, y, f"Right section two line {index}")
+            canvas.save()
+
+            page = extract_pdf_layout(pdf_path).pages[0]
+            texts = [line.text for line in page.lines]
+
+            self.assertLess(
+                texts.index("Right section one line 0"),
+                texts.index("Section 2"),
+            )
+            self.assertLess(
+                texts.index("Section 2"),
+                texts.index("Left section two line 0"),
+            )
+            self.assertLess(
+                texts.index("Left section two line 3"),
+                texts.index("Right section two line 0"),
+            )
+
+    def test_reading_order_can_be_disabled_with_explicit_warning(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            pdf_path = Path(temporary_directory) / "disabled-order.pdf"
+            canvas = Canvas(str(pdf_path), pagesize=(600, 800))
+            canvas.setFont("Helvetica", 10)
+            for index, y in enumerate((700, 680, 660)):
+                canvas.drawString(72, y, f"Left {index}")
+                canvas.drawString(360, y, f"Right {index}")
+            canvas.save()
+
+            disabled_layout = extract_pdf_layout(
+                pdf_path,
+                block_reading_order_enabled=False,
+            )
+            page = disabled_layout.pages[0]
+
+            self.assertTrue(page.reading_order_warnings)
+            self.assertLess(page.reading_order_confidence, 0.7)
+            self.assertTrue(all(block.reading_order >= 0 for block in page.content_blocks))
+            document = build_document_ir(
+                source_pdf=pdf_path,
+                page_routes=["text"],
+                page_sizes=[(page.width, page.height)],
+                layout=disabled_layout,
+            )
+            report = document.quality_report()
+            self.assertEqual(report["needs_review_pages"], [1])
+            self.assertTrue(report["page_results"][0]["reading_order_warnings"])
+
+    def test_math_like_short_block_is_marked_as_formula(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            pdf_path = Path(temporary_directory) / "formula.pdf"
+            canvas = Canvas(str(pdf_path), pagesize=(360, 480))
+            canvas.setFont("Helvetica", 10)
+            canvas.drawString(50, 360, "x = y + 1")
+            canvas.drawString(50, 330, "This is ordinary text.")
+            canvas.save()
+
+            page = extract_pdf_layout(pdf_path).pages[0]
+
+            formula_blocks = [
+                block for block in page.content_blocks if block.block_type == "FORMULA"
+            ]
+            self.assertEqual(len(formula_blocks), 1)
+            self.assertEqual(formula_blocks[0].text_block.text, "x = y + 1")
+
     def test_two_column_lines_are_read_column_by_column(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             pdf_path = Path(temporary_directory) / "two-column.pdf"

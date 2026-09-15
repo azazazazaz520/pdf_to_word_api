@@ -8,13 +8,14 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 import re
 from typing import Any
 
 from .models import (
     PdfImageBlock,
+    PdfContentBlock,
     PdfPageLayout,
     PdfTable,
     PdfTextBlock,
@@ -23,6 +24,39 @@ from .models import (
     _MIN_TABLE_WIDTH,
 )
 from .tables import _line_in_table
+
+
+@dataclass(frozen=True)
+class ReadingOrderConfig:
+    """集中维护新增阅读顺序判断使用的阈值。"""
+
+    min_column_candidates: int = 6
+    column_min_gap: float = 12.0
+    column_center_min_ratio: float = 0.2
+    column_center_max_ratio: float = 0.8
+    column_merge_gap: float = 24.0
+    full_width_ratio: float = 0.65
+    min_horizontal_overlap: float = 0.12
+    block_gap_factor: float = 1.75
+    font_size_delta_factor: float = 0.35
+    font_size_delta_min: float = 2.0
+    horizontal_alignment_factor: float = 2.5
+    side_by_side_overlap: float = 0.25
+    side_by_side_top_delta_factor: float = 0.75
+    caption_min_horizontal_overlap: float = 0.12
+    caption_center_tolerance_factor: float = 2.0
+    caption_min_center_distance: float = 18.0
+    caption_min_gap: float = 14.0
+    caption_gap_factor: float = 3.5
+    title_size_delta: float = 1.8
+    short_text_limit: int = 80
+    title_center_ratio: float = 0.12
+    title_center_min_distance: float = 24.0
+    footnote_top_ratio: float = 0.78
+    footnote_size_ratio: float = 0.9
+
+
+DEFAULT_READING_ORDER_CONFIG = ReadingOrderConfig()
 
 
 def _is_page_number_text(value: str) -> bool:
@@ -100,16 +134,31 @@ def _detect_column_boundaries(
     lines: list[PdfTextLine],
     page_width: float,
     tables: tuple[PdfTable, ...],
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
 ) -> tuple[float, ...]:
     """通过跨行稳定空白带检测多栏分栏边界。"""
+    body_sizes = sorted(
+        float(line.font_size)
+        for line in lines
+        if not line.is_header_footer and float(line.font_size) > 0.0
+    )
+    body_size = body_sizes[len(body_sizes) // 2] if body_sizes else 0.0
     candidates = [
         line
         for line in lines
         if not line.is_header_footer
         and not _line_in_table(line, tables)
-        and line.x1 - line.x0 < page_width * 0.65
+        and line.x1 - line.x0 < page_width * config.full_width_ratio
+        and not (
+            body_size > 0.0
+            and line.font_size >= body_size + config.title_size_delta
+            and len(line.text.strip()) <= config.short_text_limit
+            and not line.text.strip().endswith(
+                ("。", ".", "；", ";", "：", ":")
+            )
+        )
     ]
-    if len(candidates) < 6:
+    if len(candidates) < config.min_column_candidates:
         return ()
     intervals = [(line.x0, line.x1) for line in candidates]
     edges = sorted({value for interval in intervals for value in interval})
@@ -117,10 +166,14 @@ def _detect_column_boundaries(
     for left, right in zip(edges, edges[1:]):
         # 分栏留白由整栏文字让出，十几点的间距已是明显分栏；
         # 更窄的间距属于行内字距，不作为分栏依据。
-        if right - left < 12.0:
+        if right - left < config.column_min_gap:
             continue
         midpoint = (left + right) / 2.0
-        if not (page_width * 0.2 <= midpoint <= page_width * 0.8):
+        if not (
+            page_width * config.column_center_min_ratio
+            <= midpoint
+            <= page_width * config.column_center_max_ratio
+        ):
             continue
         if any(x0 - 1.0 <= midpoint <= x1 + 1.0 for x0, x1 in intervals):
             continue
@@ -131,7 +184,7 @@ def _detect_column_boundaries(
     boundaries: list[float] = []
     for left, right in gaps:
         boundary = (left + right) / 2.0
-        if not boundaries or boundary - boundaries[-1] >= 24.0:
+        if not boundaries or boundary - boundaries[-1] >= config.column_merge_gap:
             boundaries.append(boundary)
     return tuple(boundaries)
 
@@ -209,6 +262,7 @@ def _sort_lines_in_reading_order(
     lines: tuple[PdfTextLine, ...],
     boundaries: tuple[float, ...],
     page_width: float,
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
 ) -> tuple[PdfTextLine, ...]:
     """按分栏边界重排文本行；跨栏标题保持在全宽位置。"""
     ordered_lines = _normalize_row_order(
@@ -219,7 +273,7 @@ def _sort_lines_in_reading_order(
     separator_ids = {
         id(line)
         for line in ordered_lines
-        if line.x1 - line.x0 >= page_width * 0.65
+        if line.x1 - line.x0 >= page_width * config.full_width_ratio
         or any(line.x0 < boundary < line.x1 for boundary in boundaries)
     }
     groups: list[list[PdfTextLine]] = []
@@ -256,14 +310,183 @@ def _line_column_index(
     line: PdfTextLine,
     boundaries: tuple[float, ...],
     page_width: float,
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
 ) -> int:
     if not boundaries:
         return 0
-    if line.width >= page_width * 0.65 or any(
+    if line.width >= page_width * config.full_width_ratio or any(
         line.x0 < boundary < line.x1 for boundary in boundaries
     ):
         return -1
     return bisect_right(boundaries, line.center_x)
+
+
+def _region_for_bbox(
+    bbox: tuple[float, float, float, float],
+    *,
+    boundaries: tuple[float, ...],
+    page_width: float,
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
+) -> str:
+    """根据页面局部栏位给内容块分配稳定的区域编号。"""
+    x0, _, x1, _ = bbox
+    if (
+        x1 - x0 >= page_width * config.full_width_ratio
+        or any(x0 < boundary < x1 for boundary in boundaries)
+    ):
+        return "full-width"
+    if not boundaries:
+        return "region-0"
+    return f"column-{bisect_right(boundaries, (x0 + x1) / 2.0)}"
+
+
+def _vertical_overlap_ratio(
+    left: Any,
+    right: Any,
+) -> float:
+    overlap = max(min(left.bottom, right.bottom) - max(left.top, right.top), 0.0)
+    denominator = max(min(left.bottom - left.top, right.bottom - right.top), 1.0)
+    return overlap / denominator
+
+
+def _text_block_size(block: PdfTextBlock) -> float:
+    sizes = sorted(
+        float(line.font_size)
+        for line in block.lines
+        if float(line.font_size) > 0.0
+    )
+    return sizes[len(sizes) // 2] if sizes else max(block.height, 1.0)
+
+
+def _looks_like_formula_block(value: str) -> bool:
+    text = value.strip()
+    if not text or len(text) > 120:
+        return False
+    if re.search(r"[{};]", text):
+        return False
+    if not re.search(r"[=≤≥≈∑∏∫√∞∂∇α-ωΑ-Ω₀-₉⁰-⁹]", text):
+        return False
+    return bool(re.search(r"[+\-−·*/^_()=≤≥≈]", text))
+
+
+def _caption_distance(
+    caption: PdfTextBlock,
+    target_bbox: tuple[float, float, float, float],
+    *,
+    config: ReadingOrderConfig,
+) -> tuple[str, float] | None:
+    target_x0, target_top, target_x1, target_bottom = target_bbox
+    horizontal_overlap = max(
+        min(caption.x1, target_x1) - max(caption.x0, target_x0),
+        0.0,
+    )
+    horizontal = horizontal_overlap / max(
+        min(caption.width, target_x1 - target_x0),
+        1.0,
+    )
+    if horizontal < config.caption_min_horizontal_overlap and abs(
+        caption.center_x - (target_x0 + target_x1) / 2.0
+    ) > max(
+        caption.height * config.caption_center_tolerance_factor,
+        config.caption_min_center_distance,
+    ):
+        return None
+    size = max(_text_block_size(caption), 1.0)
+    max_gap = max(config.caption_min_gap, size * config.caption_gap_factor)
+    if caption.bottom <= target_top:
+        gap = target_top - caption.bottom
+        if gap <= max_gap:
+            return "before", gap
+    if target_bottom <= caption.top:
+        gap = caption.top - target_bottom
+        if gap <= max_gap:
+            return "after", gap
+    return None
+
+
+def _classify_text_blocks(
+    blocks: tuple[PdfTextBlock, ...],
+    *,
+    tables: tuple[PdfTable, ...] = (),
+    images: tuple[PdfImageBlock, ...] = (),
+    page_width: float,
+    page_height: float,
+    boundaries: tuple[float, ...],
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
+) -> tuple[PdfTextBlock, ...]:
+    """给文本块标记类型、区域和可信度。"""
+    body_sizes = sorted(
+        _text_block_size(block)
+        for block in blocks
+        if not block.is_header_footer and block.text.strip()
+    )
+    body_size = body_sizes[len(body_sizes) // 2] if body_sizes else 0.0
+    classified: list[PdfTextBlock] = []
+    for block in blocks:
+        text = block.text.strip()
+        block_type = "TEXT"
+        confidence = 0.82
+        needs_review = False
+        if block.is_header_footer:
+            if _is_page_number_text(text):
+                block_type = "PAGE_NUMBER"
+            elif block.center_y <= page_height / 2.0:
+                block_type = "HEADER"
+            else:
+                block_type = "FOOTER"
+            confidence = 0.98
+        elif any(
+            _caption_distance(block, target.bbox, config=config) is not None
+            for target in (*tables, *images)
+        ) and len(block.lines) <= 2 and len(text) <= 120:
+            block_type = "CAPTION"
+            confidence = 0.78
+        elif _looks_like_formula_block(text) and len(block.lines) <= 3:
+            block_type = "FORMULA"
+            confidence = 0.76
+        elif (
+            len(block.lines) <= 3
+            and len(text) <= config.short_text_limit
+            and _text_block_size(block) >= body_size + config.title_size_delta
+            and not text.endswith(("。", ".", "；", ";", "：", ":"))
+        ):
+            block_type = "TITLE"
+            confidence = 0.74
+        elif (
+            body_size > 0.0
+            and block.top >= page_height * config.footnote_top_ratio
+            and _text_block_size(block) <= body_size * config.footnote_size_ratio
+            and len(text) >= 4
+        ):
+            block_type = "FOOTNOTE"
+            confidence = 0.64
+        region_id = _region_for_bbox(
+            block.bbox,
+            boundaries=boundaries,
+            page_width=page_width,
+            config=config,
+        )
+        if (
+            block_type == "TITLE"
+            and abs((block.x0 + block.x1) / 2.0 - page_width / 2.0)
+            <= max(
+                page_width * config.title_center_ratio,
+                config.title_center_min_distance,
+            )
+        ):
+            region_id = "full-width"
+        if block_type in {"TITLE", "CAPTION", "FOOTNOTE"} and confidence < 0.7:
+            needs_review = True
+        classified.append(
+            replace(
+                block,
+                block_type=block_type,
+                confidence=confidence,
+                region_id=region_id,
+                needs_review=needs_review,
+            )
+        )
+    return tuple(classified)
 
 
 def _text_block_from_lines(
@@ -343,6 +566,8 @@ def _can_extend_text_block(
     current: PdfTextLine,
     previous_column: int,
     current_column: int,
+    *,
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
 ) -> bool:
     if previous_column != current_column:
         return False
@@ -350,6 +575,15 @@ def _can_extend_text_block(
         return False
     if not _same_text_direction(previous, current):
         return False
+    if previous.font_size > 0.0 and current.font_size > 0.0:
+        size_delta = abs(previous.font_size - current.font_size)
+        size_limit = max(
+            config.font_size_delta_min,
+            max(previous.font_size, current.font_size)
+            * config.font_size_delta_factor,
+        )
+        if size_delta > size_limit:
+            return False
     scale = max(
         float(previous.font_size or 0.0),
         float(current.font_size or 0.0),
@@ -367,7 +601,26 @@ def _can_extend_text_block(
         gap = previous_low - current_high
     else:
         gap = 0.0
-    return gap <= max(8.0, scale * 1.75)
+    overlap = max(
+        min(previous.x1, current.x1) - max(previous.x0, current.x0),
+        0.0,
+    )
+    overlap_ratio = overlap / max(min(previous.width, current.width), 1.0)
+    same_left = abs(previous.x0 - current.x0) <= max(
+        8.0,
+        scale * config.horizontal_alignment_factor,
+    )
+    same_center = abs(previous.center_x - current.center_x) <= max(
+        12.0,
+        scale * config.horizontal_alignment_factor * 1.5,
+    )
+    if (
+        overlap_ratio < config.min_horizontal_overlap
+        and not same_left
+        and not same_center
+    ):
+        return False
+    return gap <= max(8.0, scale * config.block_gap_factor)
 
 
 def _build_text_blocks(
@@ -375,32 +628,537 @@ def _build_text_blocks(
     *,
     boundaries: tuple[float, ...],
     page_width: float,
+    tables: tuple[PdfTable, ...] = (),
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
 ) -> tuple[PdfTextBlock, ...]:
-    """按方向、栏位和行间距把文本行聚合成几何版面块。"""
-    blocks: list[PdfTextBlock] = []
-    current: list[PdfTextLine] = []
-    current_column = 0
-
-    def flush() -> None:
-        nonlocal current
-        if current:
-            blocks.append(_text_block_from_lines(current, current_column))
-            current = []
-
-    for line in lines:
-        column = _line_column_index(line, boundaries, page_width)
-        if not current:
-            current = [line]
-            current_column = column
+    """先按几何相邻关系建立文本块，不依赖整页阅读顺序。"""
+    ordered_lines = sorted(
+        lines,
+        key=lambda line: (line.top, line.x0, line.z_order, line.text),
+    )
+    grouped: list[list[PdfTextLine]] = []
+    columns: list[int] = []
+    for line in ordered_lines:
+        column = _line_column_index(
+            line,
+            boundaries,
+            page_width,
+            config=config,
+        )
+        candidates: list[tuple[float, float, int]] = []
+        for index, group in enumerate(grouped):
+            previous = group[-1]
+            if _line_in_table(previous, tables) != _line_in_table(line, tables):
+                continue
+            if not _can_extend_text_block(
+                previous,
+                line,
+                columns[index],
+                column,
+                config=config,
+            ):
+                continue
+            gap = max(
+                previous.top - line.bottom,
+                line.top - previous.bottom,
+                0.0,
+            )
+            candidates.append((gap, abs(previous.top - line.top), index))
+        if candidates:
+            _, _, selected = min(candidates)
+            grouped[selected].append(line)
             continue
-        if not _can_extend_text_block(
-            current[-1], line, current_column, column
-        ):
-            flush()
-            current_column = column
-        current.append(line)
-    flush()
+        grouped.append([line])
+        columns.append(column)
+
+    blocks: list[PdfTextBlock] = []
+    for index, (group, column) in enumerate(zip(grouped, columns)):
+        normalized = _normalize_row_order(
+            tuple(sorted(group, key=lambda line: (line.top, line.x0)))
+        )
+        block = _text_block_from_lines(list(normalized), column)
+        blocks.append(
+            replace(
+                block,
+                block_id=f"text-{index}",
+                region_id=_region_for_bbox(
+                    block.bbox,
+                    boundaries=boundaries,
+                    page_width=page_width,
+                    config=config,
+                ),
+            )
+        )
     return tuple(blocks)
+
+
+def _content_block_layer(
+    block_type: str,
+) -> str:
+    if block_type in {"HEADER"}:
+        return "header"
+    if block_type in {"FOOTER", "PAGE_NUMBER"}:
+        return "footer"
+    return "body"
+
+
+def _region_sort_key(region_id: str) -> tuple[int, str]:
+    match = re.fullmatch(r"column-(\d+)", region_id)
+    if match:
+        return int(match.group(1)), region_id
+    return 999, region_id
+
+
+def _build_content_blocks(
+    text_blocks: tuple[PdfTextBlock, ...],
+    *,
+    tables: tuple[PdfTable, ...],
+    images: tuple[PdfImageBlock, ...],
+    vectors: tuple[PdfVectorObject, ...],
+    boundaries: tuple[float, ...],
+    page_width: float,
+    page_height: float,
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
+    reading_order_enabled: bool = True,
+    fallback_enabled: bool = True,
+) -> tuple[tuple[PdfContentBlock, ...], float, tuple[str, ...]]:
+    """把文字、表格、图片和矢量对象放入同一条阅读顺序输入。"""
+    classified = _classify_text_blocks(
+        text_blocks,
+        tables=tables,
+        images=images,
+        page_width=page_width,
+        page_height=page_height,
+        boundaries=boundaries,
+        config=config,
+    )
+    items: list[PdfContentBlock] = []
+    for index, block in enumerate(classified):
+        block_id = block.block_id or f"text-{index}"
+        block = replace(block, block_id=block_id)
+        items.append(
+            PdfContentBlock(
+                block_id=block_id,
+                block_type=block.block_type,
+                bbox=block.bbox,
+                text_block=block,
+                source="text_layout",
+                confidence=block.confidence,
+                region_id=block.region_id,
+                layer=_content_block_layer(block.block_type),
+                needs_review=block.needs_review,
+            )
+        )
+    for index, table in enumerate(tables):
+        items.append(
+            PdfContentBlock(
+                block_id=f"table-{index}",
+                block_type="TABLE",
+                bbox=table.bbox,
+                table=table,
+                source="vector_table",
+                region_id=_region_for_bbox(
+                    table.bbox,
+                    boundaries=boundaries,
+                    page_width=page_width,
+                    config=config,
+                ),
+            )
+        )
+    for index, image in enumerate(images):
+        items.append(
+            PdfContentBlock(
+                block_id=f"image-{index}",
+                block_type="IMAGE",
+                bbox=image.bbox,
+                image=image,
+                source=image.source,
+                region_id=_region_for_bbox(
+                    image.bbox,
+                    boundaries=boundaries,
+                    page_width=page_width,
+                    config=config,
+                ),
+                layer=image.layer,
+            )
+        )
+    for index, vector in enumerate(vectors):
+        items.append(
+            PdfContentBlock(
+                block_id=f"vector-{index}",
+                block_type="VECTOR",
+                bbox=vector.bbox,
+                vector=vector,
+                source="pdf_vector",
+                region_id=_region_for_bbox(
+                    vector.bbox,
+                    boundaries=boundaries,
+                    page_width=page_width,
+                    config=config,
+                ),
+                layer=vector.layer,
+            )
+        )
+    return _sort_content_blocks_in_reading_order(
+        tuple(items),
+        boundaries=boundaries,
+        page_width=page_width,
+        config=config,
+        reading_order_enabled=reading_order_enabled,
+        fallback_enabled=fallback_enabled,
+    )
+
+
+def _add_order_edge(
+    edges: list[set[int]],
+    source: int,
+    target: int,
+) -> None:
+    if source != target:
+        edges[source].add(target)
+
+
+def _is_body_item(item: PdfContentBlock) -> bool:
+    return item.layer not in {"header", "footer"}
+
+
+def _participates_in_reading_order(item: PdfContentBlock) -> bool:
+    """装饰性矢量对象参与输出，但不单独制造文字先后关系。"""
+    return item.block_type != "VECTOR"
+
+
+def _is_full_width_item(
+    item: PdfContentBlock,
+    *,
+    page_width: float,
+    config: ReadingOrderConfig,
+) -> bool:
+    return item.region_id == "full-width" or (
+        item.width >= page_width * config.full_width_ratio
+    )
+
+
+def _add_caption_edges(
+    items: tuple[PdfContentBlock, ...],
+    edges: list[set[int]],
+    *,
+    config: ReadingOrderConfig,
+) -> dict[int, int]:
+    parents: dict[int, int] = {}
+    targets = [
+        index
+        for index, item in enumerate(items)
+        if item.block_type in {"IMAGE", "TABLE"}
+    ]
+    for caption_index, caption in enumerate(items):
+        if caption.block_type != "CAPTION":
+            continue
+        candidates: list[tuple[float, int, str]] = []
+        text_block = caption.text_block
+        if text_block is None:
+            continue
+        for target_index in targets:
+            relation = _caption_distance(
+                text_block,
+                items[target_index].bbox,
+                config=config,
+            )
+            if relation is None:
+                continue
+            position, distance = relation
+            candidates.append((distance, target_index, position))
+        if not candidates:
+            continue
+        _, target_index, position = min(candidates)
+        parents[caption_index] = target_index
+        if position == "before":
+            _add_order_edge(edges, caption_index, target_index)
+        else:
+            _add_order_edge(edges, target_index, caption_index)
+    return parents
+
+
+def _fallback_content_order(
+    items: tuple[PdfContentBlock, ...],
+    *,
+    boundaries: tuple[float, ...],
+    page_width: float,
+    config: ReadingOrderConfig,
+) -> list[int]:
+    """关系图冲突时，按旧的分栏/坐标规则生成确定性顺序。"""
+    def geometry_key(index: int) -> tuple[Any, ...]:
+        item = items[index]
+        column, region = _region_sort_key(item.region_id)
+        return (column, item.top, region, item.x0, index)
+
+    header_indices = sorted(
+        (index for index, item in enumerate(items) if item.layer == "header"),
+        key=geometry_key,
+    )
+    footer_indices = sorted(
+        (index for index, item in enumerate(items) if item.layer == "footer"),
+        key=geometry_key,
+    )
+    body_indices = [
+        index for index, item in enumerate(items) if item.layer == "body"
+    ]
+    if not boundaries:
+        body_order = sorted(body_indices, key=lambda index: (
+            items[index].top,
+            items[index].x0,
+            index,
+        ))
+        return header_indices + body_order + footer_indices
+
+    anchors = sorted(
+        (
+            index
+            for index in body_indices
+            if _participates_in_reading_order(items[index])
+            and _is_full_width_item(
+                items[index],
+                page_width=page_width,
+                config=config,
+            )
+        ),
+        key=lambda index: (items[index].top, items[index].x0, index),
+    )
+    non_anchor_indices = [index for index in body_indices if index not in anchors]
+    sections: dict[int, list[int]] = {}
+    for index in non_anchor_indices:
+        section = sum(
+            items[anchor].bottom <= items[index].top + 1.0
+            for anchor in anchors
+        )
+        sections.setdefault(section, []).append(index)
+
+    body_order: list[int] = []
+    for section in range(len(anchors) + 1):
+        body_order.extend(
+            sorted(
+                sections.get(section, ()),
+                key=geometry_key,
+            )
+        )
+        if section < len(anchors):
+            body_order.append(anchors[section])
+    return header_indices + body_order + footer_indices
+
+
+def _sort_content_blocks_in_reading_order(
+    items: tuple[PdfContentBlock, ...],
+    *,
+    boundaries: tuple[float, ...],
+    page_width: float,
+    config: ReadingOrderConfig = DEFAULT_READING_ORDER_CONFIG,
+    reading_order_enabled: bool = True,
+    fallback_enabled: bool = True,
+) -> tuple[tuple[PdfContentBlock, ...], float, tuple[str, ...]]:
+    """用内容块关系图生成页面阅读顺序。"""
+    if not items:
+        return (), 1.0, ()
+    edges: list[set[int]] = [set() for _ in items]
+    body_indices = [
+        index
+        for index, item in enumerate(items)
+        if _is_body_item(item) and _participates_in_reading_order(item)
+    ]
+    header_indices = [
+        index
+        for index, item in enumerate(items)
+        if item.layer == "header" and _participates_in_reading_order(item)
+    ]
+    footer_indices = [
+        index
+        for index, item in enumerate(items)
+        if item.layer == "footer" and _participates_in_reading_order(item)
+    ]
+    for header in header_indices:
+        for body in body_indices:
+            _add_order_edge(edges, header, body)
+        for footer in footer_indices:
+            _add_order_edge(edges, header, footer)
+    for body in body_indices:
+        for footer in footer_indices:
+            _add_order_edge(edges, body, footer)
+
+    anchors = sorted(
+        [
+            index
+            for index in body_indices
+            if _is_full_width_item(
+                items[index],
+                page_width=page_width,
+                config=config,
+            )
+        ],
+        key=lambda index: (items[index].top, items[index].x0, index),
+    )
+    for left, right in zip(anchors, anchors[1:]):
+        _add_order_edge(edges, left, right)
+    for anchor in anchors:
+        anchor_item = items[anchor]
+        for item_index in body_indices:
+            if item_index == anchor:
+                continue
+            item = items[item_index]
+            if item.bottom <= anchor_item.top + 1.0:
+                _add_order_edge(edges, item_index, anchor)
+            elif anchor_item.bottom <= item.top + 1.0:
+                _add_order_edge(edges, anchor, item_index)
+
+    sections: dict[int, list[int]] = {}
+    for item_index in body_indices:
+        if item_index in anchors:
+            continue
+        section = sum(
+            items[anchor_index].bottom <= items[item_index].top + 1.0
+            for anchor_index in anchors
+        )
+        sections.setdefault(section, []).append(item_index)
+
+    for section_indices in sections.values():
+        region_groups: dict[str, list[int]] = {}
+        for item_index in section_indices:
+            region_groups.setdefault(items[item_index].region_id, []).append(
+                item_index
+            )
+        for group in region_groups.values():
+            ordered = sorted(
+                group,
+                key=lambda index: (items[index].top, items[index].x0, index),
+            )
+            for left, right in zip(ordered, ordered[1:]):
+                if items[left].bottom <= items[right].top + 1.0:
+                    _add_order_edge(edges, left, right)
+                elif items[right].bottom <= items[left].top + 1.0:
+                    _add_order_edge(edges, right, left)
+
+        column_groups = {
+            region: group
+            for region, group in region_groups.items()
+            if re.fullmatch(r"column-\d+", region)
+        }
+        column_names = sorted(column_groups, key=_region_sort_key)
+        for left_name, right_name in zip(column_names, column_names[1:]):
+            for left in column_groups[left_name]:
+                for right in column_groups[right_name]:
+                    if (
+                        items[left].block_type == "CAPTION"
+                        or items[right].block_type == "CAPTION"
+                    ):
+                        continue
+                    _add_order_edge(edges, left, right)
+
+    if not boundaries:
+        for left_index, left in enumerate(items):
+            if not _is_body_item(left) or not _participates_in_reading_order(left):
+                continue
+            for right_index in range(left_index + 1, len(items)):
+                right = items[right_index]
+                if (
+                    not _is_body_item(right)
+                    or not _participates_in_reading_order(right)
+                ):
+                    continue
+                if abs(left.top - right.top) > max(
+                    12.0,
+                    min(left.height, right.height)
+                    * config.side_by_side_top_delta_factor,
+                ):
+                    continue
+                if _vertical_overlap_ratio(left, right) < config.side_by_side_overlap:
+                    continue
+                if left.x1 <= right.x0:
+                    _add_order_edge(edges, left_index, right_index)
+                elif right.x1 <= left.x0:
+                    _add_order_edge(edges, right_index, left_index)
+
+    caption_parents = _add_caption_edges(items, edges, config=config)
+    for footnote_index, footnote in enumerate(items):
+        if footnote.block_type != "FOOTNOTE":
+            continue
+        for body_index in body_indices:
+            if body_index != footnote_index:
+                _add_order_edge(edges, body_index, footnote_index)
+
+    if not reading_order_enabled:
+        ordered_indices = _fallback_content_order(
+            items,
+            boundaries=boundaries,
+            page_width=page_width,
+            config=config,
+        )
+        warnings = ["内容块阅读顺序已关闭，已使用坐标备用顺序。"]
+        confidence = 0.6
+    else:
+        warnings = []
+        confidence = 0.96 if boundaries else 0.86
+
+    indegree = [0] * len(items)
+    for source_edges in edges:
+        for target in source_edges:
+            indegree[target] += 1
+
+    def ready_key(index: int) -> tuple[Any, ...]:
+        item = items[index]
+        layer = {"header": 0, "body": 1, "footer": 2}.get(item.layer, 1)
+        region_index, region_name = _region_sort_key(item.region_id)
+        return (layer, item.top, region_index, region_name, item.x0, index)
+
+    if reading_order_enabled:
+        ready = [index for index, value in enumerate(indegree) if value == 0]
+        ordered_indices = []
+        while ready:
+            ready.sort(key=ready_key)
+            current = ready.pop(0)
+            ordered_indices.append(current)
+            for target in sorted(edges[current]):
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    ready.append(target)
+        if len(ordered_indices) != len(items):
+            ordered_indices = _fallback_content_order(
+                items,
+                boundaries=boundaries,
+                page_width=page_width,
+                config=config,
+            )
+            if fallback_enabled:
+                warnings.append("内容块关系存在冲突，已使用坐标备用顺序。")
+            else:
+                warnings.append("内容块关系存在冲突，已强制使用确定性坐标顺序。")
+            confidence = 0.45
+
+    ordered: list[PdfContentBlock] = []
+    for reading_order, item_index in enumerate(ordered_indices):
+        item = items[item_index]
+        parent_index = caption_parents.get(item_index)
+        parent_id = (
+            items[parent_index].block_id
+            if parent_index is not None
+            else item.parent_id
+        )
+        text_block = item.text_block
+        if text_block is not None:
+            text_block = replace(
+                text_block,
+                parent_id=parent_id,
+                reading_order=reading_order,
+                needs_review=item.needs_review or bool(warnings),
+            )
+        ordered.append(
+            replace(
+                item,
+                text_block=text_block,
+                parent_id=parent_id,
+                reading_order=reading_order,
+                needs_review=item.needs_review or bool(warnings),
+            )
+        )
+    if not boundaries and len(body_indices) > 1:
+        confidence = min(confidence, 0.82)
+    return tuple(ordered), confidence, tuple(warnings)
 
 
 def _line_column_bounds(

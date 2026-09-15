@@ -10,6 +10,7 @@
 - [WeKnora 转换评估](docs/weknora-conversion-assessment.md)
 - [验证摘要](docs/validation-summary.md)
 - [项目目录说明](docs/project-structure.md)
+- [内容块阅读顺序改造记录](docs/block-reading-order-implementation-2026-09-15.md)
 
 ## 环境
 
@@ -103,6 +104,8 @@ Prism 客户端使用 Supabase 匿名会话产生的短期 JWT 调用上述接�
 - `PDF_SERVICE_TEXT_FULL_PAGE_IMAGE_MIN_PIXELS`：识别全页背景图像的最小像素数，默认 300000。
 - `PDF_SERVICE_TEXT_GARBLED_CHAR_RATIO`：异常字形比例阈值，默认 0.05。
 - `PDF_SERVICE_EXPORT_MODE`：默认 `structured`。普通正文输出为可重排的 Word 段落；识别出的表格输出为原生 Word 表格，公式优先输出 OMML，图片输出为内嵌图片。可选 `fidelity` 或 `fidelity_hybrid` 保留按源坐标绝对定位的兼容路径，`flow` 是 `structured` 的兼容别名；也可在创建任务时通过 multipart 的 `export_mode` 覆盖默认值。
+- `PDF_SERVICE_BLOCK_READING_ORDER_ENABLED`：默认 `true`。启用“先建立内容块，再按内容块关系排序”的新逻辑。
+- `PDF_SERVICE_BLOCK_READING_ORDER_FALLBACK_ENABLED`：默认 `true`。关系无法形成完整顺序时，记录并使用确定性的坐标备用顺序。
 - `PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS`：整页图像像素上限，默认 4194304。
 - `PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY`：混合模式页面图像 JPEG 质量，默认 88。
 - `PDF_SERVICE_TOKEN`：服务端长期内部令牌，必须配置；仍支持使用该令牌进行服务端管理调用。

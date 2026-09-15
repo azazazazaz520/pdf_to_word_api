@@ -583,6 +583,12 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                         DEFAULT_EMBEDDED_IMAGE_JPEG_QUALITY,
                     )
                 ),
+                block_reading_order_enabled=bool(
+                    payload.get("block_reading_order_enabled", True)
+                ),
+                block_reading_order_fallback_enabled=bool(
+                    payload.get("block_reading_order_fallback_enabled", True)
+                ),
             )
             writer.emit(
                 "text_layout_completed",

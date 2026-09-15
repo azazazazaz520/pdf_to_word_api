@@ -15,7 +15,15 @@ class DocumentIRTest(unittest.TestCase):
                     height=842.0,
                     route="text",
                     blocks=[
-                        IRBlock(kind="heading1", page=1, text="标题"),
+                        IRBlock(
+                            kind="heading1",
+                            page=1,
+                            text="标题",
+                            block_id="text-0",
+                            block_type="TITLE",
+                            reading_order=0,
+                            region_id="full-width",
+                        ),
                         IRBlock(kind="paragraph", page=1, text="正文"),
                         IRBlock(kind="table", page=1, table=object()),
                         IRBlock(
@@ -65,6 +73,9 @@ class DocumentIRTest(unittest.TestCase):
         self.assertEqual(report["needs_review_pages"], [2])
         self.assertEqual(report["page_results"][0]["route"], "text")
         self.assertEqual(report["page_results"][1]["media_count"], 1)
+        self.assertEqual(report["page_results"][0]["reading_order_confidence"], None)
+        self.assertEqual(document.pages[0].blocks[0].to_dict()["reading_order"], 0)
+        self.assertEqual(document.pages[0].blocks[0].to_dict()["block_type"], "TITLE")
 
     def test_route_summary_defaults_to_empty(self) -> None:
         report = IRDocument().quality_report()

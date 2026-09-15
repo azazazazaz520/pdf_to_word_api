@@ -1546,7 +1546,13 @@ def export_fidelity_docx(
                 ),
                 default=None,
             )
-            blocks.sort(key=lambda item: (item.z_order, item.kind))
+            blocks.sort(
+                key=lambda item: (
+                    item.z_order,
+                    item.reading_order if item.reading_order >= 0 else 10**9,
+                    item.kind,
+                )
+            )
             for block in blocks:
                 if id(block) in white_backgrounds:
                     # Word 页面本身就是白色，重复画白底会盖住页眉/页脚

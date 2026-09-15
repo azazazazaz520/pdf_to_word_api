@@ -79,8 +79,12 @@ class PdfTextGlyph:
         return self.bbox[2]
 
     @property
-    def bottom(self) -> float:
-        return self.bbox[3]
+    def center_x(self) -> float:
+        return (self.x0 + self.x1) / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return (self.top + self.bottom) / 2.0
 
     @property
     def width(self) -> float:
@@ -89,6 +93,10 @@ class PdfTextGlyph:
     @property
     def height(self) -> float:
         return max(self.bottom - self.top, 0.0)
+
+    @property
+    def bottom(self) -> float:
+        return self.bbox[3]
 
 
 @dataclass(frozen=True)
@@ -179,7 +187,11 @@ class PdfTextLine:
 
 @dataclass(frozen=True)
 class PdfTextBlock:
-    """由几何相邻文本行组成的版面文本块。"""
+    """由几何相邻文本行组成的版面文本块。
+
+    ``reading_order`` 只表示页面内顺序；块的类型和关系信息在建立后统一
+    传给 IR，导出阶段不再从原始坐标重新猜测顺序。
+    """
 
     lines: tuple[PdfTextLine, ...]
     bbox: tuple[float, float, float, float]
@@ -187,6 +199,13 @@ class PdfTextBlock:
     direction: tuple[float, float] = (1.0, 0.0)
     rotation: float = 0.0
     is_header_footer: bool = False
+    block_id: str = ""
+    block_type: str = "TEXT"
+    confidence: float = 1.0
+    reading_order: int = -1
+    parent_id: str | None = None
+    region_id: str = ""
+    needs_review: bool = False
 
     @property
     def text(self) -> str:
@@ -203,6 +222,22 @@ class PdfTextBlock:
     @property
     def x1(self) -> float:
         return self.bbox[2]
+
+    @property
+    def center_x(self) -> float:
+        return (self.x0 + self.x1) / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return (self.top + self.bottom) / 2.0
+
+    @property
+    def width(self) -> float:
+        return max(self.x1 - self.x0, 0.0)
+
+    @property
+    def height(self) -> float:
+        return max(self.bottom - self.top, 0.0)
 
     @property
     def bottom(self) -> float:
@@ -305,6 +340,50 @@ class PdfTable:
 
 
 @dataclass(frozen=True)
+class PdfContentBlock:
+    """页面中参与阅读顺序的统一内容块。"""
+
+    block_id: str
+    block_type: str
+    bbox: tuple[float, float, float, float]
+    text_block: PdfTextBlock | None = None
+    table: PdfTable | None = None
+    image: PdfImageBlock | None = None
+    vector: PdfVectorObject | None = None
+    source: str = ""
+    confidence: float = 1.0
+    reading_order: int = -1
+    parent_id: str | None = None
+    region_id: str = ""
+    layer: str = "body"
+    needs_review: bool = False
+
+    @property
+    def top(self) -> float:
+        return self.bbox[1]
+
+    @property
+    def bottom(self) -> float:
+        return self.bbox[3]
+
+    @property
+    def x0(self) -> float:
+        return self.bbox[0]
+
+    @property
+    def x1(self) -> float:
+        return self.bbox[2]
+
+    @property
+    def width(self) -> float:
+        return max(self.x1 - self.x0, 0.0)
+
+    @property
+    def height(self) -> float:
+        return max(self.bottom - self.top, 0.0)
+
+
+@dataclass(frozen=True)
 class PdfPageLayout:
     """保存单页的尺寸、文本行、几何文本块、表格和矢量对象。"""
 
@@ -317,6 +396,9 @@ class PdfPageLayout:
     vectors: tuple[PdfVectorObject, ...] = ()
     has_page_background: bool = False
     text_blocks: tuple[PdfTextBlock, ...] = ()
+    content_blocks: tuple[PdfContentBlock, ...] = ()
+    reading_order_confidence: float = 1.0
+    reading_order_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

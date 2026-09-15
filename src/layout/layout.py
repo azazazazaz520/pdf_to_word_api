@@ -21,6 +21,7 @@ from .models import (
     _PAGEOBJ_TEXT,
 )
 from .reading_order import (
+    _build_content_blocks,
     _build_text_blocks,
     _annotate_line_metrics,
     _mark_logos,
@@ -49,6 +50,8 @@ def extract_pdf_layout(
     image_png_optimize: bool = DEFAULT_EMBEDDED_IMAGE_PNG_OPTIMIZE,
     image_jpeg_quality: int = DEFAULT_EMBEDDED_IMAGE_JPEG_QUALITY,
     include_fidelity: bool = False,
+    block_reading_order_enabled: bool = True,
+    block_reading_order_fallback_enabled: bool = True,
 ) -> PdfDocumentLayout:
     """提取文本行、图片、几何表格和矢量对象，并按多栏阅读顺序重排。
 
@@ -97,12 +100,6 @@ def extract_pdf_layout(
                     ),
                 )
                 tables = tuple(sorted(tables, key=lambda table: table.bbox[1]))
-                vectors: tuple[PdfVectorObject, ...] = ()
-                if include_fidelity:
-                    vectors = _filter_table_border_vectors(
-                        _extract_vector_objects(page, height),
-                        tables,
-                    )
                 if (
                     include_page_images is not None
                     and (page_number - 1) not in include_page_images
@@ -164,31 +161,56 @@ def extract_pdf_layout(
             )
             for page in updated_pages
         )
-    updated_pages = tuple(
-        replace(
-            page,
-            lines=_sort_lines_in_reading_order(
+    updated_pages = _mark_table_continuations(updated_pages)
+    updated_pages = _mark_logos(updated_pages)
+    ordered_pages: list[PdfPageLayout] = []
+    for page in updated_pages:
+        block_input_lines = page.lines
+        if not block_reading_order_enabled:
+            block_input_lines = _sort_lines_in_reading_order(
                 page.lines,
                 page.columns,
                 page.width,
-            ),
+            )
+        text_blocks = _build_text_blocks(
+            block_input_lines,
+            boundaries=page.columns,
+            page_width=page.width,
+            tables=page.tables,
         )
-        for page in updated_pages
-    )
-    if include_fidelity:
-        updated_pages = _mark_logos(updated_pages)
-    updated_pages = tuple(
-        replace(
-            page,
-            text_blocks=_build_text_blocks(
-                page.lines,
-                boundaries=page.columns,
-                page_width=page.width,
-            ),
+        content_blocks, order_confidence, order_warnings = _build_content_blocks(
+            text_blocks,
+            tables=page.tables,
+            images=page.images,
+            vectors=page.vectors,
+            boundaries=page.columns,
+            page_width=page.width,
+            page_height=page.height,
+            reading_order_enabled=block_reading_order_enabled,
+            fallback_enabled=block_reading_order_fallback_enabled,
         )
-        for page in updated_pages
-    )
-    return PdfDocumentLayout(pages=_mark_table_continuations(updated_pages))
+        ordered_text_blocks = tuple(
+            item.text_block
+            for item in content_blocks
+            if item.text_block is not None
+        )
+        ordered_lines = tuple(
+            line
+            for block in ordered_text_blocks
+            for line in block.lines
+        )
+        ordered_pages.append(
+            replace(
+                page,
+                lines=ordered_lines,
+                text_blocks=ordered_text_blocks,
+                content_blocks=content_blocks,
+                reading_order_confidence=order_confidence,
+                reading_order_warnings=order_warnings,
+            )
+        )
+    updated_pages = tuple(ordered_pages)
+    return PdfDocumentLayout(pages=updated_pages)
 
 
 def _filter_table_border_vectors(

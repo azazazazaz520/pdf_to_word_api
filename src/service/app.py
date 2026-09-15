@@ -150,6 +150,12 @@ class ServiceConfig:
     fidelity_revalidate_after_fallback: bool = _env_bool(
         "PDF_SERVICE_FIDELITY_REVALIDATE_AFTER_FALLBACK", True
     )
+    block_reading_order_enabled: bool = _env_bool(
+        "PDF_SERVICE_BLOCK_READING_ORDER_ENABLED", True
+    )
+    block_reading_order_fallback_enabled: bool = _env_bool(
+        "PDF_SERVICE_BLOCK_READING_ORDER_FALLBACK_ENABLED", True
+    )
     render_compare_max_pages: int | None = None
     quality_gate_enabled: bool = _env_bool(
         "PDF_SERVICE_QUALITY_GATE_ENABLED", True
@@ -691,6 +697,10 @@ class JobManager:
             "fidelity_revalidate_after_fallback": (
                 CONFIG.fidelity_revalidate_after_fallback
             ),
+            "block_reading_order_enabled": CONFIG.block_reading_order_enabled,
+            "block_reading_order_fallback_enabled": (
+                CONFIG.block_reading_order_fallback_enabled
+            ),
             "quality_gate_enabled": CONFIG.quality_gate_enabled,
             "page_delta_warn_ratio": CONFIG.page_delta_warn_ratio,
             "page_delta_warn_absolute": CONFIG.page_delta_warn_absolute,
@@ -1160,6 +1170,8 @@ def health() -> dict[str, Any]:
             "code_structure": True,
             "render_validation": CONFIG.render_validation,
             "per_page_ocr": True,
+            "block_reading_order": CONFIG.block_reading_order_enabled,
+            "reading_order_quality_report": True,
         },
         "worker_processes": CONFIG.worker_processes,
         "max_pending_jobs": CONFIG.max_pending_jobs,
@@ -1179,6 +1191,10 @@ def health() -> dict[str, Any]:
         "embedded_image_max_pixels": CONFIG.embedded_image_max_pixels,
         "embedded_image_jpeg_quality": CONFIG.embedded_image_jpeg_quality,
         "embedded_image_png_optimize": CONFIG.embedded_image_png_optimize,
+        "block_reading_order_enabled": CONFIG.block_reading_order_enabled,
+        "block_reading_order_fallback_enabled": (
+            CONFIG.block_reading_order_fallback_enabled
+        ),
         "render_validation": CONFIG.render_validation,
         "render_timeout_seconds": CONFIG.render_timeout_seconds,
         "quality_gate_enabled": CONFIG.quality_gate_enabled,

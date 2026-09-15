@@ -8,6 +8,7 @@ outputs/
 qa/
 artifacts/
 tmp/
+docs/
 
 *.upload
 .env
