@@ -1,29 +1,76 @@
-# PDF 转 Word 独立可行性验证
+# pdf转word服务
 
-本目录用于在 Prism 主工程之外验证 PaddleOCR PDF 解析、表格识别、多页重组和 DOCX 导出能力。
+一个基于 Python、FastAPI、PaddleOCR 和 `python-docx` 的 PDF 转 Word 服务。服务接收 PDF 文件，创建异步转换任务，按页面特征选择文本解析或 OCR 路线，最终生成可下载的 `.docx` 文件。
 
-目录约定：`src` 保存核心实现，`tests` 保存自动化测试，`scripts` 保存样本生成和验证入口，`fixtures` 保存可复现的合成 PDF，`docs` 保存评估与验证结论，`artifacts` 保存被 `.gitignore` 忽略的运行结果。`model_cache` 和 `service_data` 分别用于模型缓存和服务运行状态。
+## 功能
 
-主要文档：
+- 提供健康检查、任务创建、任务查询、结果下载和任务取消接口。
+- 校验 PDF 文件头、文件大小、页数、解析状态和加密状态。
+- 使用独立 worker 进程执行转换，API 进程负责认证、上传、任务调度和结果查询。
+- 使用本地 SQLite 保存任务状态，任务文件按 TTL 清理；服务重启后可以恢复仍存在输入文件的未完成任务。
+- 支持 Bearer Token、`X-API-Key`，以及配置 Supabase 后使用 Supabase 用户 JWT 调用。
+- 自动分析文本层，并按页面选择文本解析或 OCR；也可以通过任务参数强制指定路线。
+- 支持标题、段落、项目符号、有序列表、常见公式、原生 Word 表格、嵌入图片和 PDF 书签。
+- 提供两种 DOCX 导出模式：默认的结构化导出，以及按源坐标保留版式的高保真导出。
+- 记录转换阶段、OCR 置信度、页面复核提示、渲染校验和质量门禁结果。
 
-- [当前讨论结论](docs/current-discussion-results.md)
-- [WeKnora 转换评估](docs/weknora-conversion-assessment.md)
-- [验证摘要](docs/validation-summary.md)
-- [项目目录说明](docs/project-structure.md)
-- [内容块阅读顺序改造记录](docs/block-reading-order-implementation-2026-09-15.md)
+## 转换路线
 
-## 环境
+服务采用“先分析，再转换”的处理方式：
 
-- Python：3.11.15
-- PaddlePaddle：3.3.1，CPU 版
-- PaddleOCR：3.7.0
-- PaddleX：3.7.2，安装 `ocr` 额外依赖
-- Word 导出：`python-docx` 1.2.0
-- PDF 页面渲染：`pypdfium2` 5.13.0
-- PDF 结构检查：`pypdf` 6.16.2
-- 模型缓存：`D:\pdf_validation\model_cache`
+```text
+上传 PDF
+   │
+   ├─ 文件和 PDF 校验
+   ├─ 创建任务并写入 SQLite
+   └─ worker 处理
+        ├─ auto：逐页分析文本层，有文本页面走 text，无文本页面走 ocr
+        ├─ text：满足文本层阈值后，全部页面走文本布局解析
+        └─ ocr：全部页面渲染后交给 PaddleOCR
+              │
+              ├─ structured：段落、标题、列表、表格和图片的可编辑导出
+              └─ fidelity：按源坐标定位文本、表格和图片，尽量保留页面版式
+```
 
-Python 3.11 用于兼容当前 Windows CPU 版 PaddlePaddle。执行脚本时使用虚拟环境解释器的完整路径，避免调用系统 Python：
+### 路由参数
+
+| 参数 | 可选值 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `route_mode` | `auto`、`text`、`ocr` | `auto` | 控制文本层分析和 OCR 使用方式 |
+| `export_mode` | `structured`、`flow`、`fidelity`、`fidelity_hybrid` | `structured` | `flow` 是 `structured` 的兼容别名 |
+| `PDF_SERVICE_ENGINE` | `structure-lite`、`structure-table-lite`、`structure`、`vl` | `structure-lite` | OCR/结构识别引擎；仅在需要 OCR 的页面加载模型 |
+
+选择建议：
+
+- 普通文字型 PDF：使用 `route_mode=auto` 和 `export_mode=structured`。
+- 需要识别扫描文字：使用 `auto` 或 `ocr`；OCR 结果需要根据 `needs_review_pages` 和质量报告复核。
+- 需要原生 Word 表格：选择支持表格识别的 `structure-table-lite`，或使用文本层布局路线。
+- 更重视源文件坐标和视觉版式：选择 `fidelity` 或 `fidelity_hybrid`。高保真导出仍会受到 PDF 字体、复杂对象和 Word 排版规则的影响。
+- `vl` 和完整 `structure` 引擎在当前 CPU 环境下耗时和内存开销较高，适合作为按需增强路线。
+
+## 环境要求
+
+- Windows 10/11，或 Linux x86_64
+- Python 3.11
+- CPU 版 PaddlePaddle 3.3.1
+- PaddleOCR 3.7.0
+- PaddleX 3.7.2，并安装 `ocr` 额外依赖
+- `python-docx` 1.2.0
+- `pypdfium2` 5.13.0
+- FastAPI 0.116.1 和 Uvicorn 0.35.0
+
+依赖版本以 [requirements.txt](requirements.txt) 为准。核心 PDF 解析、OCR、DOCX 导出和 HTTP 服务代码使用跨平台 Python 库，Windows 和 Linux 均可运行。当前项目主要在 Windows CPU 环境完成验证，Linux 需要按照本机发行版和 PaddlePaddle 提供的 wheel 进行安装后再做完整验收。
+
+首次运行 OCR 路线时会下载模型，模型缓存默认放在 `model_cache/`；服务任务和 SQLite 数据默认放在 `service_data/`。这两个目录以及 `artifacts/` 都属于本地运行目录，不应提交到版本库。
+
+Linux 运行时有两个已知差异：
+
+- `PDF_SERVICE_RENDER_VALIDATION` 默认值为 `true`，其 DOCX 渲染步骤依赖 Microsoft Word COM，只能在安装了 Microsoft Word 的 Windows 环境执行。Linux 启动服务时建议设置为 `false`，或自行接入 LibreOffice 等兼容的 DOCX 渲染器。
+- 当前字体扫描逻辑优先读取 Windows 注册表和 `C:\Windows\Fonts`。Linux 仍可完成转换，但高保真导出中的系统字体匹配可能退回字体替代；需要高保真验收时，应准备与 PDF 相同或等价的字体，并单独检查渲染结果。
+
+## 安装
+
+在项目根目录的 PowerShell 中执行：
 
 ```powershell
 uv venv --python 3.11 .venv
@@ -32,121 +79,325 @@ uv venv --python 3.11 .venv
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 运行验证
+Linux 下使用 Bash 执行等价安装：
+
+```bash
+python3.11 -m venv .venv
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install paddlepaddle==3.3.1
+./.venv/bin/python -m pip install -r requirements.txt
+```
+
+如果当前 Linux 平台没有可用的 `paddlepaddle==3.3.1` wheel，应按照 PaddlePaddle 官方对应版本和平台说明选择安装源，再执行其余依赖安装。
+
+可以显式指定模型缓存目录：
+
+```powershell
+$env:PADDLE_PDX_CACHE_HOME = (Join-Path (Get-Location) "model_cache")
+```
+
+模型完成缓存后，如需离线复测，可以在当前 PowerShell 会话中跳过模型源检查：
+
+```powershell
+$env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = "True"
+```
+
+## 启动服务
+
+服务默认监听 `127.0.0.1:8765`，并要求配置 `PDF_SERVICE_TOKEN`。
+
+Windows PowerShell：
+
+```powershell
+$env:PDF_SERVICE_TOKEN = "请替换为随机生成的长令牌"
+$env:PDF_SERVICE_HOST = "127.0.0.1"
+$env:PDF_SERVICE_PORT = "8765"
+
+& .\.venv\Scripts\python.exe -m src.service.app
+```
+
+Linux Bash：
+
+```bash
+export PDF_SERVICE_TOKEN="请替换为随机生成的长令牌"
+export PDF_SERVICE_HOST="127.0.0.1"
+export PDF_SERVICE_PORT="8765"
+export PDF_SERVICE_RENDER_VALIDATION="false"
+
+./.venv/bin/python -m src.service.app
+```
+
+启动后可以访问 FastAPI 文档页：
+
+```text
+http://127.0.0.1:8765/docs
+```
+
+服务令牌只应保存在服务端环境变量或密钥管理系统中。部署到服务器时，应在反向代理层配置 HTTPS、访问控制、请求体限制和限流；确需局域网访问时，再将 `PDF_SERVICE_HOST` 设置为 `0.0.0.0`。
+
+## API 使用
+
+所有业务 API 接口都需要通过以下任一种方式提供凭证：
+
+```http
+Authorization: Bearer <token>
+```
+
+或：
+
+```http
+X-API-Key: <token>
+```
+
+当 `SUPABASE_URL` 和 `SUPABASE_ANON_KEY` 都已配置时，服务令牌之外还接受 Supabase 匿名会话产生的短期 JWT，并按用户限制任务查询范围。`PDF_SERVICE_TOKEN` 仍然必须配置。
+
+### 接口列表
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/health` | 返回服务、模型、队列、路由和质量配置；需要认证 |
+| `POST` | `/api/pdf-to-word/jobs` | 上传 PDF 并创建转换任务 |
+| `GET` | `/api/pdf-to-word/jobs/{job_id}` | 查询任务状态和质量摘要 |
+| `GET` | `/api/pdf-to-word/jobs/{job_id}/result` | 下载生成的 DOCX |
+| `DELETE` | `/api/pdf-to-word/jobs/{job_id}` | 取消排队或处理中的任务 |
+
+任务状态包括：`queued`、`processing`、`succeeded`、`failed`、`cancelled` 和 `timed_out`。
+
+### 创建任务
+
+上传字段：
+
+- `file`：必填，PDF 文件。
+- `route_mode`：可选，`auto`、`text` 或 `ocr`。
+- `export_mode`：可选，`structured`、`flow`、`fidelity` 或 `fidelity_hybrid`。
+
+PowerShell 示例：
+
+```powershell
+$token = $env:PDF_SERVICE_TOKEN
+$pdfPath = (Resolve-Path .\fixtures\synthetic_text_table.pdf).Path
+
+$job = curl.exe -sS `
+  -X POST "http://127.0.0.1:8765/api/pdf-to-word/jobs" `
+  -H "Authorization: Bearer $token" `
+  -F "file=@$pdfPath" `
+  -F "route_mode=auto" `
+  -F "export_mode=structured" | ConvertFrom-Json
+
+$job | ConvertTo-Json -Depth 8
+$jobId = $job.job_id
+```
+
+创建成功后，响应中会返回 `job_id`、`status`、`progress`、`route`、`export_mode`、`page_count`、`download_url` 和质量摘要字段。
+
+### 查询任务并下载结果
+
+```powershell
+$status = curl.exe -sS `
+  -H "Authorization: Bearer $token" `
+  "http://127.0.0.1:8765/api/pdf-to-word/jobs/$jobId" | ConvertFrom-Json
+
+$status | Select-Object job_id, status, progress, route, route_reason, table_count, needs_review_pages
+
+curl.exe -sS -L `
+  -H "Authorization: Bearer $token" `
+  "http://127.0.0.1:8765/api/pdf-to-word/jobs/$jobId/result" `
+  -o .\output\converted.docx
+```
+
+只有任务状态为 `succeeded` 时才能下载结果。客户端应在 `queued` 或 `processing` 状态下按间隔轮询，收到 `failed`、`cancelled` 或 `timed_out` 后读取 `error` 和 `warnings` 字段。
+
+### 常见响应状态码
+
+| 状态码 | 场景 |
+| --- | --- |
+| `400` | PDF 解析失败、加密 PDF 或路由/导出参数无效 |
+| `401` | 缺少或无法验证访问凭证 |
+| `409` | 任务尚未成功，暂时没有可下载结果 |
+| `413` | 上传文件过大、页数超过限制 |
+| `415` | 文件头不是有效 PDF |
+| `429` | 任务队列已满 |
+| `503` | 服务未配置令牌，或 Supabase 身份服务暂时不可用 |
+
+## 配置
+
+### 服务与任务
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PDF_SERVICE_HOST` | `127.0.0.1` | 监听地址 |
+| `PDF_SERVICE_PORT` | `8765` | 监听端口 |
+| `PDF_SERVICE_TOKEN` | 无 | 必填，服务端长期令牌 |
+| `PDF_SERVICE_ENGINE` | `structure-lite` | OCR/结构识别引擎 |
+| `PDF_SERVICE_WORKER_PROCESSES` | `1` | worker 数量，范围为 1–4；每个 worker 可能加载一份模型 |
+| `PDF_SERVICE_MAX_PENDING_JOBS` | `4` | 允许排队或处理中的最大任务数，不能小于 worker 数量 |
+| `PDF_SERVICE_DATA_ROOT` | `service_data` | 任务文件、SQLite 和阶段日志根目录 |
+| `PDF_SERVICE_JOB_TTL_SECONDS` | `3600` | 任务及产物保留时间 |
+| `PDF_SERVICE_CLEANUP_INTERVAL_SECONDS` | `60` | 清理周期 |
+| `PDF_SERVICE_MAX_RETRIES` | `1` | worker 失败或超时后的重试次数，范围为 0–3 |
+| `PDF_SERVICE_TASK_TIMEOUT_SECONDS` | `300` | 单任务软超时预算 |
+| `PDF_SERVICE_OCR_TIME_BUDGET_SECONDS` | `60` | 含 OCR 页面任务的 OCR 时间预算 |
+| `PDF_SERVICE_MAX_UPLOAD_BYTES` | `52428800` | 最大上传大小，默认 50 MiB |
+| `PDF_SERVICE_MAX_PAGES` | `100` | 单个 PDF 的最大页数 |
+| `PDF_SERVICE_ALLOWED_ORIGINS` | 空 | 逗号分隔的 CORS 来源列表 |
+
+### 路由与图像
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PDF_SERVICE_ROUTE_MODE` | `auto` | `auto`、`text` 或 `ocr` |
+| `PDF_SERVICE_TEXT_MIN_PAGE_CHARS` | `20` | 页面被视为可用文本页的最小字符数 |
+| `PDF_SERVICE_TEXT_MIN_PAGE_RATIO` | `0.6` | `text` 强制路线要求满足文本阈值的页面比例 |
+| `PDF_SERVICE_TEXT_HIGH_QUALITY_RATIO` | `0.8` | 文本层高质量页面比例阈值，随健康信息返回 |
+| `PDF_SERVICE_TEXT_FULL_PAGE_IMAGE_MIN_PIXELS` | `300000` | 判断全页图像信号的最小像素数 |
+| `PDF_SERVICE_TEXT_GARBLED_CHAR_RATIO` | `0.05` | 异常字形比例阈值 |
+| `PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS` | `4194304` | OCR 页面渲染像素上限，默认 4 MP |
+| `PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY` | `88` | OCR 页面 JPEG 质量 |
+| `PDF_SERVICE_EMBEDDED_IMAGE_MAX_PIXELS` | `6000000` | DOCX 内嵌图片像素上限 |
+| `PDF_SERVICE_EMBEDDED_IMAGE_JPEG_QUALITY` | `85` | DOCX 内嵌 JPEG 质量 |
+| `PDF_SERVICE_EMBEDDED_IMAGE_PNG_OPTIMIZE` | `false` | 是否优化内嵌 PNG |
+
+### 导出、字体与质量校验
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PDF_SERVICE_EXPORT_MODE` | `structured` | 默认 `structured`；支持 `flow`、`fidelity`、`fidelity_hybrid` |
+| `PDF_SERVICE_EMBED_PDF_FONTS` | `true` | 尝试嵌入 PDF 中使用的字体 |
+| `PDF_SERVICE_CALIBRATE_FONT_METRICS` | `true` | 为高保真文本定位标定字体指标 |
+| `PDF_SERVICE_INCLUDE_TOC` | `false` | 是否生成目录 |
+| `PDF_SERVICE_INCLUDE_BOOKMARKS` | `true` | 是否读取 PDF 书签并应用到标题 |
+| `PDF_SERVICE_BLOCK_READING_ORDER_ENABLED` | `true` | 是否启用内容块阅读顺序分析 |
+| `PDF_SERVICE_BLOCK_READING_ORDER_FALLBACK_ENABLED` | `true` | 阅读顺序无法完整建立时是否使用坐标顺序 |
+| `PDF_SERVICE_RENDER_VALIDATION` | `true` | 是否渲染 DOCX 并进行输出检查 |
+| `PDF_SERVICE_RENDER_SSIM` | `true` | 是否计算页面结构相似度 |
+| `PDF_SERVICE_RENDER_SSIM_DPI` | `110` | 相似度检查的渲染 DPI |
+| `PDF_SERVICE_RENDER_TEXT_COMPARE` | `true` | 是否进行文本比较 |
+| `PDF_SERVICE_SSIM_THRESHOLD` | `0.98` | 相似度质量阈值 |
+| `PDF_SERVICE_RENDER_TIMEOUT_SECONDS` | `180` | 渲染校验超时时间 |
+| `PDF_SERVICE_QUALITY_GATE_ENABLED` | `true` | 是否启用质量门禁 |
+| `PDF_SERVICE_PAGE_DELTA_WARN_RATIO` | `0.05` | 页数变化比例告警阈值 |
+| `PDF_SERVICE_PAGE_DELTA_WARN_ABSOLUTE` | `3` | 页数变化绝对值告警阈值 |
+
+### 高保真兼容路径
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PDF_SERVICE_FIDELITY_AUTO_FALLBACK` | `false` | 是否允许高保真区域自动降级 |
+| `PDF_SERVICE_FIDELITY_FALLBACK_DPI` | `200` | 降级页面渲染 DPI |
+| `PDF_SERVICE_FIDELITY_FALLBACK_MAX_PIXELS` | `2000000` | 降级图像最大像素数 |
+| `PDF_SERVICE_FIDELITY_PAGE_IMAGE_MAX_PIXELS` | `8000000` | 高保真页面图像最大像素数 |
+| `PDF_SERVICE_FIDELITY_REVALIDATE_AFTER_FALLBACK` | `true` | 降级后是否重新进行质量校验 |
+
+### Supabase 身份校验
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SUPABASE_URL` | 空 | Supabase 项目地址 |
+| `SUPABASE_ANON_KEY` | 空 | Supabase 匿名公钥 |
+| `PDF_SERVICE_SUPABASE_AUTH_TIMEOUT_SECONDS` | `5` | 身份校验请求超时时间 |
+| `PDF_SERVICE_SUPABASE_AUTH_CACHE_SECONDS` | `60` | JWT 身份缓存时间；设置为 `0` 可关闭缓存 |
+
+## 本地验证
+
+生成合成 PDF 样本：
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\generate_fixture.py
 & .\.venv\Scripts\python.exe scripts\generate_table_fixture.py
-
-# 轻量文本/版面解析，不启用表格识别
-& .\.venv\Scripts\python.exe -m src.run_validation --engine structure-lite
-
-# 轻量版面解析，启用表格识别
-& .\.venv\Scripts\python.exe -m src.run_validation --engine structure-table-lite --input .\fixtures\synthetic_table_one_page.pdf
-
-# PaddleOCR-VL，支持多页重组
-& .\.venv\Scripts\python.exe -m src.run_validation --engine vl --input .\fixtures\synthetic_text_table.pdf
 ```
 
-使用已缓存模型进行离线复测时，在当前 PowerShell 会话中设置：
+运行独立转换验证：
 
 ```powershell
-$env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = 'True'
-& .\.venv\Scripts\python.exe -m src.run_validation --engine structure-lite
+# 轻量文本和版面解析
+& .\.venv\Scripts\python.exe -m src.run_validation `
+  --engine structure-lite
+
+# 启用表格识别
+& .\.venv\Scripts\python.exe -m src.run_validation `
+  --engine structure-table-lite `
+  --input .\fixtures\synthetic_table_one_page.pdf
+
+# PaddleOCR-VL 多页重组；CPU 环境耗时较长
+& .\.venv\Scripts\python.exe -m src.run_validation `
+  --engine vl `
+  --input .\fixtures\synthetic_text_table.pdf
 ```
 
-每次运行会在 `artifacts\outputs\<engine>_<timestamp>` 下保存 JSON、Markdown、DOCX 和 `report.json`。
+指定输入文件和输出目录：
 
-运行自动化测试：
+```powershell
+& .\.venv\Scripts\python.exe -m src.run_validation `
+  --engine structure-lite `
+  --input .\fixtures\synthetic_text_table.pdf `
+  --output .\artifacts\outputs
+```
+
+每次验证会在 `artifacts\outputs\<engine>_<timestamp>\` 下生成：
+
+- `json\`：识别结果 JSON；
+- `markdown\`：PaddleOCR Markdown 结果；
+- `word\`：DOCX 结果；
+- `report.json`：运行耗时、输入信息、结果摘要和 DOCX 完整性检查。
+
+运行完整自动化测试：
 
 ```powershell
 & .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-## 第一版服务器服务
+测试覆盖文本层路由、版面和阅读顺序、表格、公式、字体、结构化导出、高保真导出、混合页面、质量校验、worker 调度、认证和服务接口。
 
-服务文件为 `src\service\app.py`，默认先分析 PDF 文本层和页面图像：文本层完整的文字型 PDF 走布局感知文本路线；存在但不完整的文本层走原始页面保真路线；没有可用文本层的文件使用默认的 `structure-lite` OCR 快速路线。布局感知文本路线会按页面坐标恢复阅读顺序，识别矢量表格并生成真实 Word 表格，同时恢复常见标题和列表结构。API 进程只负责任务接入和状态查询，实际转换交给可独立终止的 worker 进程；任务状态持久化在 `service_data\jobs.sqlite3`，任务文件保存在 `service_data\jobs`，过期任务按 TTL 清理。
+## 任务运行数据
 
-安装服务依赖后启动：
+默认每个任务目录位于 `service_data\jobs\<job_id>\`，包含：
 
-```powershell
-& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-$env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = 'True'
-$env:PDF_SERVICE_TOKEN = '请替换为随机长令牌'
-$env:SUPABASE_URL = '与 Prism 的 VITE_SUPABASE_URL 相同'
-$env:SUPABASE_ANON_KEY = '与 Prism 的 VITE_SUPABASE_ANON_KEY 相同'
-& .\.venv\Scripts\python.exe -m src.service.app
-```
+- 输入 PDF；
+- 输出 DOCX；
+- `progress.json`：最新进度和状态；
+- `stages.jsonl`：按时间追加的阶段事件；
+- 取消标记和其他任务元数据。
 
-默认仅监听 `127.0.0.1:8765`。部署到服务器时，应通过防火墙或反向代理限制访问范围；确需局域网访问时再设置 `PDF_SERVICE_HOST=0.0.0.0`，并保留 `PDF_SERVICE_TOKEN`。当前服务已将任务状态写入 SQLite，并由独立监管线程负责 worker 调度、超时终止和失败重试；正式多实例部署前仍需接入共享 Redis/数据库队列，并完成反向代理安全配置。
+任务状态同时保存在 `service_data\jobs.sqlite3`。阶段日志可用于定位文件校验、文本分析、模型加载、逐页 OCR、布局解析、DOCX 导出、渲染校验和质量门禁中的具体问题。服务默认只保留 TTL 内的任务产物，生产环境应根据数据合规要求调整存储位置和清理策略。
 
-接口：
+## 项目结构
 
 ```text
-GET    /health
-POST   /api/pdf-to-word/jobs              multipart 字段名：file
-GET    /api/pdf-to-word/jobs/{job_id}
-GET    /api/pdf-to-word/jobs/{job_id}/result
-DELETE /api/pdf-to-word/jobs/{job_id}
+pdf_to_word_api/
+├─ src/
+│  ├─ service/       FastAPI 服务、任务管理和 SQLite 状态存储
+│  ├─ worker/        worker 进度与质量处理
+│  ├─ layout/        PDF 文本、图片、矢量和表格版面解析
+│  ├─ ir/            文档中间表示和书签处理
+│  ├─ export/        structured / fidelity DOCX 导出
+│  ├─ fonts/         字体解析、匹配、嵌入和指标标定
+│  ├─ validate/      DOCX 渲染、文本和相似度校验
+│  ├─ pdf_worker.py  单任务转换入口
+│  ├─ pdf_routing.py 文本层和页面特征分析
+│  └─ run_validation.py 独立验证入口
+├─ tests/            unittest 自动化测试
+├─ scripts/          合成 PDF 样本生成脚本
+├─ fixtures/         可复现的 PDF 输入样本
+├─ docs/             评估报告、实施记录和验证结论
+├─ artifacts/        本地验证产物
+├─ model_cache/      PaddleOCR 模型缓存
+├─ service_data/     服务任务和状态数据
+├─ requirements.txt  Python 依赖
+└─ README.md         使用说明
 ```
 
-Prism 客户端使用 Supabase 匿名会话产生的短期 JWT 调用上述接口；PDF_SERVICE_TOKEN 仅保留在服务端环境中，也可用于服务端管理调用。
+## 当前边界
 
-环境变量：
+- PDF 转 Word 的结果受原始 PDF 文本层、扫描质量、字体、阅读顺序和版面复杂度影响，不能保证所有文件达到逐像素一致。
+- `structured` 模式优先保留可编辑结构，正文可能按照 Word 页面宽度重新排版。
+- OCR 路线会产生模型加载和逐页推理开销；当前 CPU 实测时间随模型、页数和文件内容变化，不能据少量样本承诺固定耗时。
+- `fidelity` 路线适合高保真兼容场景，复杂字体、透明对象、无边框表格和特殊 PDF 绘图指令仍需单独验收。
+- 当前任务存储为单机本地 SQLite 和文件目录，适合独立服务和联调。多实例部署前还需要共享队列、跨主机 worker 租约、进程树回收、资源隔离和反向代理安全配置。
+- 真实业务样本不应直接放入版本库；建议在受控目录中进行批量质量、耗时、页数、DOCX 体积和失败率评估。
 
-- `PDF_SERVICE_ENGINE`：默认 `structure-lite`，适合普通扫描文字的快速 OCR；需要表格结构时可设置为 `structure-table-lite`。
-- `PDF_SERVICE_WORKER_PROCESSES`：独立 worker 进程数，默认 1；每个进程可能各自加载 OCR 模型，不建议在内存有限的服务器上盲目增加。
-- `PDF_SERVICE_MAX_PENDING_JOBS`：队列中允许存在的最大任务数，默认 4；达到上限时创建接口返回 `429`。
-- `PDF_SERVICE_ROUTE_MODE`：默认 `auto`。`auto` 自动检测文本层；`text` 强制文本层快速路线；`ocr` 跳过检测并强制使用 OCR。
-- `PDF_SERVICE_TEXT_MIN_PAGE_CHARS`：文本层页面的最小有效字符数，默认 20。
-- `PDF_SERVICE_TEXT_MIN_PAGE_RATIO`：达到最小字符数的页面占比阈值，默认 0.6。
-- `PDF_SERVICE_TEXT_HIGH_QUALITY_RATIO`：文本层质量足够高的页面占比阈值，默认 0.8；低于该阈值时自动使用页面保真路线。
-- `PDF_SERVICE_TEXT_FULL_PAGE_IMAGE_MIN_PIXELS`：识别全页背景图像的最小像素数，默认 300000。
-- `PDF_SERVICE_TEXT_GARBLED_CHAR_RATIO`：异常字形比例阈值，默认 0.05。
-- `PDF_SERVICE_EXPORT_MODE`：默认 `structured`。普通正文输出为可重排的 Word 段落；识别出的表格输出为原生 Word 表格，公式优先输出 OMML，图片输出为内嵌图片。可选 `fidelity` 或 `fidelity_hybrid` 保留按源坐标绝对定位的兼容路径，`flow` 是 `structured` 的兼容别名；也可在创建任务时通过 multipart 的 `export_mode` 覆盖默认值。
-- `PDF_SERVICE_BLOCK_READING_ORDER_ENABLED`：默认 `true`。启用“先建立内容块，再按内容块关系排序”的新逻辑。
-- `PDF_SERVICE_BLOCK_READING_ORDER_FALLBACK_ENABLED`：默认 `true`。关系无法形成完整顺序时，记录并使用确定性的坐标备用顺序。
-- `PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS`：整页图像像素上限，默认 4194304。
-- `PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY`：混合模式页面图像 JPEG 质量，默认 88。
-- `PDF_SERVICE_TOKEN`：服务端长期内部令牌，必须配置；仍支持使用该令牌进行服务端管理调用。
-- `SUPABASE_URL`：Prism 使用的 Supabase 项目地址。配置后，PDF API 接受 Prism 匿名登录产生的短期 JWT。
-- `SUPABASE_ANON_KEY`：对应 Supabase 项目的匿名公钥，用于服务端调用 `/auth/v1/user` 校验客户端 JWT。
-- `PDF_SERVICE_SUPABASE_AUTH_TIMEOUT_SECONDS`：Supabase 身份校验超时时间，默认 5 秒。
-- `PDF_SERVICE_SUPABASE_AUTH_CACHE_SECONDS`：JWT 身份缓存时间，默认 60 秒。
-- `PDF_SERVICE_DATA_ROOT`：任务临时目录根路径。
-- `PDF_SERVICE_MAX_UPLOAD_BYTES`：默认 50 MiB。
-- `PDF_SERVICE_MAX_PAGES`：默认 100 页。
-- `PDF_SERVICE_JOB_TTL_SECONDS`：默认 3600 秒。
-- `PDF_SERVICE_ALLOWED_ORIGINS`：可选，逗号分隔的 CORS 来源列表。
-- `PDF_SERVICE_TASK_TIMEOUT_SECONDS`：默认 300 秒，所有任务的软超时预算。
-- `PDF_SERVICE_OCR_TIME_BUDGET_SECONDS`：默认 60 秒，OCR 任务的快速路线软超时预算。
-- `PDF_SERVICE_MAX_RETRIES`：默认 1 次；worker 异常退出、失败或超时后自动重试，设置为 0 可关闭重试。
+## 相关文档
 
-每个任务目录包含 `progress.json` 和 `stages.jsonl`。前者保存最新状态，后者记录 worker 进程写入的阶段事件，便于定位模型加载、推理、导出和失败原因。
-
-任务状态同时写入 `jobs.sqlite3`。服务重启时，仍有输入文件的 `queued`/`processing` 任务会恢复为排队状态；任务达到重试上限后才进入最终失败或超时状态。
-
-OCR 任务会在 `stages.jsonl` 中为每个页面记录识别行数、平均和最低置信度、低置信度比例、疑似乱码比例及 `ocr_needs_review` 标志。当前超时首先在页面或阶段边界检查，属于软超时；监管线程还会按任务预算强制终止仍在运行的 worker，并根据重试次数决定重新排队或进入最终失败状态。
-
-## 当前验证结论
-
-- `structure-lite`：两页样本成功，缓存后约 34 秒；关闭表格识别时，表格会作为版面内容或图片处理，不应作为最终的可编辑表格方案。
-- 普通扫描件快路径：单页扫描样本经 API 成功，模型加载约 15.25 秒，OCR 推理约 7.69 秒，worker 总耗时约 23.02 秒；页面平均置信度 0.9712，最低置信度 0.9452，未触发复核标志。该结果为单页缓存模型样本，不代表多页文件的 P95。
-- `structure-table-lite`：单页表格成功识别，16 个单元格内容与输入一致，生成的 DOCX 中包含真实 `w:tbl` 表格；缓存后约 42 秒。
-- `vl`：两页样本成功重组为一个 DOCX，表格内容可编辑；缓存后初始化约 73 秒，两页 CPU 推理约 324 秒，模型权重约 1.79 GiB，运行工作集约 4.3-6 GiB。
-- 真实日报样本：两页 VL 推理成功，正文和编号列表内容基本完整；项目符号条目内容保留但转换为普通段落，未保留为 Word 列表，初始化约 74 秒，CPU 推理约 939 秒。
-- 第一版服务端到端：`structure-table-lite` 处理真实日报成功，任务创建、状态查询、DOCX 下载和输入校验均通过；本机首次服务任务约 145 秒，生成 38 KiB DOCX。服务原型在 CPU 推理期间可能出现状态查询延迟，后续接入服务器时应使用独立工作进程或进程级任务队列。
-- `PPStructureV3` 默认完整配置：启用 oneDNN 时触发当前 CPU 路径的属性转换错误；关闭 oneDNN 后资源占用持续增长到约 7 GiB 且未在可接受时间内完成，不建议作为当前机器的默认配置。
-- 文本层快速路线：已实现自动检测；满足阈值的 PDF 不加载 OCR 模型，直接按页面坐标恢复阅读顺序，识别矢量表格并生成包含真实 Word 表格的 DOCX。当前已通过自动分流、无模型加载、布局结构和文本内容回归测试。
-- 真实日报文本层快速路线：分析约 0.131 秒，DOCX 导出约 0.034 秒，总耗时约 0.165 秒；该结果不代表扫描件或复杂版面文件的耗时。
-- 独立 worker 路线：已通过子进程完成文本路线转换，API 进程不持有 OCR 模型；worker 状态和阶段日志可从任务目录读取。
-- 文本层完整性路由：已加入有效字符数、异常字形、URL 占比和全页图像信号；文本层不完整时不会再误导出为纯文本，而是只保留完整的原始页面视觉内容。
-- 特殊数学字体映射：先通过 Unicode NFKC 将数学字母归一化为可编辑的拉丁字母或希腊字母，再修复已确认的下标、约束括号和项目符号编码；无法确认含义的异常字符仍会触发页面保真路线。
-- 数学公式文字型 PDF 实测：4 页 PDF 自动进入 `text` 路线，文本分析约 0.10 秒、DOCX 导出约 0.04 秒、worker 总耗时约 0.15 秒；输出为 4 页 A4 可编辑 DOCX，已确认的数学字符映射正确且未写入页面图片。
-- 文本导出结构恢复：按物理换行合并逻辑段落，识别标题、二级标题、项目符号、有序列表和公式；跨页列表保持连续，遇到新标题后重新编号，项目符号按 Word 列表格式输出。
-- 文本层 PDF 布局导出：使用 `pypdfium2` 保留文本行坐标和页面尺寸，通过矢量线恢复表格边界、列宽、表头和单元格；第二轮已支持基于局部线段覆盖率恢复跨行、跨列单元格、跨页续表表头，并将行高映射到固定布局的 Word 表格。
-- 结构识别覆盖常见的 `1.`、`1)`、`（1）`、`①` 编号，以及以 `max`、`min`、`s.t.`、`∑`、`∫`、`√` 等形式开头的公式；OCR 文本块也复用相同的段落和列表恢复逻辑。
-- 目标 PDF 回归验证：`U202442475闫耀天.pdf` 经 API 端到端处理成功，4 页文本层完整，源文本与 DOCX 正文比对未发现实质性漏字或误合并，Word 实际渲染无额外白页。
-- WeKnora 结构回归验证：`WeKnora论文测试报告.pdf` 经文本层 Worker 端到端处理成功，恢复 15 个标题节点、9 个真实 Word 表格和项目符号列表；Word 渲染为 7 页 A4，未发现额外空白页或表格裁切。
-
-验证目录中的 `fixtures` PDF 是合成样本；真实扫描 PDF、复杂表格、多栏文档、旋转页面、图片和公式仍需补充样本后单独验收。默认 `structured` 模式优先保证内容结构和编辑性，正文允许随 Word 页面宽度重排；`fidelity` 模式用于需要保留源坐标的兼容场景。结构化导出中的公式、表格和图片降级情况会写入 `quality.structured`，页面级复核信息仍由 `needs_review_pages` 提供。页面图像像素上限可通过环境变量调整。
+- [项目目录说明](docs/project-structure.md)
+- [验证摘要](docs/validation-summary.md)
+- [当前讨论结论](docs/current-discussion-results.md)
+- [WeKnora 转换评估](docs/weknora-conversion-assessment.md)
