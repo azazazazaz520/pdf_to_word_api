@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 from typing import Any
+import math
 from .models import (
     PdfVectorObject,
     _COORDINATE_TOLERANCE,
@@ -98,25 +99,35 @@ def _extract_vector_lines(
     horizontal: list[_HorizontalLine] = []
     vertical: list[_VerticalLine] = []
     for obj in page.get_objects(filter=[_PAGEOBJ_PATH]):
-        x0, y0, x1, y1 = (float(value) for value in obj.get_bounds())
-        width = abs(x1 - x0)
-        height = abs(y1 - y0)
-        if height <= _MAX_LINE_THICKNESS and width >= _MIN_HORIZONTAL_LINE_LENGTH:
-            horizontal.append(
-                _HorizontalLine(
-                    top=page_height - (y0 + y1) / 2,
-                    x0=min(x0, x1),
-                    x1=max(x0, x1),
+        segments, _ = _path_segments(obj, page_height)
+        previous: tuple[float, float] | None = None
+        for label, x, top in segments:
+            if label == "M":
+                previous = (x, top)
+                continue
+            if previous is None or label != "L":
+                previous = (x, top)
+                continue
+            previous_x, previous_top = previous
+            width = abs(x - previous_x)
+            height = abs(top - previous_top)
+            if height <= _MAX_LINE_THICKNESS and width >= _MIN_HORIZONTAL_LINE_LENGTH:
+                horizontal.append(
+                    _HorizontalLine(
+                        top=(top + previous_top) / 2.0,
+                        x0=min(previous_x, x),
+                        x1=max(previous_x, x),
+                    )
                 )
-            )
-        elif width <= _MAX_LINE_THICKNESS and height >= _MIN_VERTICAL_LINE_LENGTH:
-            vertical.append(
-                _VerticalLine(
-                    x=(x0 + x1) / 2,
-                    top=page_height - max(y0, y1),
-                    bottom=page_height - min(y0, y1),
+            elif width <= _MAX_LINE_THICKNESS and height >= _MIN_VERTICAL_LINE_LENGTH:
+                vertical.append(
+                    _VerticalLine(
+                        x=(previous_x + x) / 2.0,
+                        top=min(previous_top, top),
+                        bottom=max(previous_top, top),
+                    )
                 )
-            )
+            previous = (x, top)
     return _cluster_horizontal_lines(horizontal), _cluster_vertical_lines(vertical)
 
 
@@ -207,6 +218,7 @@ def _path_segments(
         pdfium_raw.FPDF_SEGMENT_BEZIERTO: "C",
         pdfium_raw.FPDF_SEGMENT_MOVETO: "M",
     }
+    matrix = _object_matrix(page_object)
     segments: list[tuple[str, float, float]] = []
     closed = False
     for index in range(count):
@@ -224,16 +236,37 @@ def _path_segments(
                 pass
             kind = int(pdfium_raw.FPDFPathSegment_GetType(segment))
             label = labels.get(kind, "M")
-            segments.append(
-                (
-                    label,
-                    float(point_x.value),
-                    page_height - float(point_y.value),
-                )
+            x_page, y_page = _transform_point(
+                float(point_x.value),
+                float(point_y.value),
+                matrix,
             )
+            segments.append((label, x_page, page_height - y_page))
         except Exception:
             continue
     return tuple(segments), closed
+
+
+def _object_matrix(
+    page_object: Any,
+) -> tuple[float, float, float, float, float, float]:
+    """读取 PDF 对象矩阵；缺少矩阵时使用单位矩阵。"""
+    try:
+        values = list(page_object.get_matrix().get())
+        if len(values) >= 6:
+            return tuple(float(value) for value in values[:6])
+    except Exception:
+        pass
+    return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
+def _transform_point(
+    x: float,
+    y: float,
+    matrix: tuple[float, float, float, float, float, float],
+) -> tuple[float, float]:
+    a, b, c, d, e, f = matrix
+    return a * x + c * y + e, b * x + d * y + f
 
 
 def _path_draw_mode(page_object: Any) -> tuple[bool, bool]:

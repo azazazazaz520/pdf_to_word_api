@@ -33,6 +33,8 @@ from .models import (
     PdfPageLayout,
     _COORDINATE_TOLERANCE,
     _HorizontalLine,
+    PdfTextGlyph,
+    PdfTextSpan,
 )
 
 def _table_boundary_lines(
@@ -221,6 +223,58 @@ def _line_in_tables(line: PdfTextLine, tables: tuple[PdfTable, ...]) -> bool:
     return any(_line_in_table(line, (table,)) for table in tables)
 
 
+def _cell_spans_from_glyphs(
+    glyphs: list[PdfTextGlyph],
+) -> tuple[PdfTextSpan, ...]:
+    """按字符样式重建单元格内的连续 span。"""
+    if not glyphs:
+        return ()
+    spans: list[PdfTextSpan] = []
+    current: list[PdfTextGlyph] = []
+    for glyph in glyphs:
+        if current and (
+            glyph.font_name != current[0].font_name
+            or glyph.pdf_font_name != current[0].pdf_font_name
+            or glyph.bold != current[0].bold
+            or glyph.italic != current[0].italic
+            or glyph.color != current[0].color
+        ):
+            spans.append(_make_cell_span(current))
+            current = []
+        current.append(glyph)
+    if current:
+        spans.append(_make_cell_span(current))
+    return tuple(spans)
+
+
+def _make_cell_span(glyphs: list[PdfTextGlyph]) -> PdfTextSpan:
+    representative = glyphs[0]
+    return PdfTextSpan(
+        text="".join(glyph.text for glyph in glyphs),
+        bbox=(
+            min(glyph.bbox[0] for glyph in glyphs),
+            min(glyph.bbox[1] for glyph in glyphs),
+            max(glyph.bbox[2] for glyph in glyphs),
+            max(glyph.bbox[3] for glyph in glyphs),
+        ),
+        font_name=representative.font_name,
+        pdf_font_name=representative.pdf_font_name,
+        font_size=representative.font_size,
+        color=representative.color,
+        bold=representative.bold,
+        italic=representative.italic,
+        rotation=representative.rotation,
+        z_order=min(glyph.z_order for glyph in glyphs),
+        direction=representative.direction,
+        glyphs=tuple(glyphs),
+        source_char_ids=tuple(
+            glyph.source_char_id for glyph in glyphs if glyph.source_char_id
+        ),
+        nominal_font_size=representative.nominal_font_size,
+        font_size_source=representative.font_size_source,
+    )
+
+
 def _extract_table(
     lines: list[PdfTextLine],
     candidate: _TableCandidate,
@@ -230,6 +284,10 @@ def _extract_table(
     row_boundaries = candidate.row_boundaries
     cell_spans = _extract_cell_spans(candidate)
     cell_lines: dict[tuple[int, int], list[PdfTextLine]] = {
+        (row_index, column_index): []
+        for row_index, column_index, _, _ in cell_spans
+    }
+    cell_glyphs: dict[tuple[int, int], list[PdfTextGlyph]] = {
         (row_index, column_index): []
         for row_index, column_index, _, _ in cell_spans
     }
@@ -253,7 +311,42 @@ def _extract_table(
         if not matching_cells:
             continue
         _, cell_key = max(matching_cells, key=lambda item: item[0])
-        cell_lines[cell_key].append(line)
+        if not line.glyphs:
+            cell_lines[cell_key].append(line)
+            continue
+        for glyph in line.glyphs:
+            glyph_matches: list[tuple[float, tuple[int, int]]] = []
+            glyph_center_x = (glyph.bbox[0] + glyph.bbox[2]) / 2.0
+            glyph_center_y = (glyph.bbox[1] + glyph.bbox[3]) / 2.0
+            for row_index, column_index, row_span, column_span in cell_spans:
+                cell_top = row_boundaries[row_index]
+                cell_bottom = row_boundaries[row_index + row_span]
+                cell_x0 = column_boundaries[column_index]
+                cell_x1 = column_boundaries[column_index + column_span]
+                overlap_x = min(glyph.bbox[2], cell_x1) - max(
+                    glyph.bbox[0], cell_x0
+                )
+                overlap_y = min(glyph.bbox[3], cell_bottom) - max(
+                    glyph.bbox[1], cell_top
+                )
+                center_inside = (
+                    cell_x0 <= glyph_center_x <= cell_x1
+                    and cell_top <= glyph_center_y <= cell_bottom
+                )
+                if overlap_x <= 0 and not center_inside:
+                    continue
+                if overlap_y <= 0 and not center_inside:
+                    continue
+                score = max(overlap_x, 0.1) * max(overlap_y, 0.1)
+                if center_inside:
+                    score += 1_000.0
+                glyph_matches.append((score, (row_index, column_index)))
+            if glyph_matches:
+                _, glyph_cell_key = max(
+                    glyph_matches,
+                    key=lambda item: item[0],
+                )
+                cell_glyphs[glyph_cell_key].append(glyph)
 
     rows = [
         ["" for _ in range(max(len(column_boundaries) - 1, 0))]
@@ -265,18 +358,68 @@ def _extract_table(
             cell_lines[(row_index, column_index)],
             key=lambda line: (line.top, line.x0),
         )
-        text = "\n".join(line.text for line in values).strip()
+        glyphs = sorted(
+            cell_glyphs[(row_index, column_index)],
+            key=lambda glyph: (
+                glyph.char_index if glyph.char_index >= 0 else 10**9,
+                glyph.bbox[1],
+                glyph.bbox[0],
+            ),
+        )
+        if glyphs:
+            text = "".join(glyph.text for glyph in glyphs).strip()
+        else:
+            text = "\n".join(line.text for line in values).strip()
         rows[row_index][column_index] = text
         text_bbox = (
             (
-                min(line.x0 for line in values),
-                min(line.top for line in values),
-                max(line.x1 for line in values),
-                max(line.bottom for line in values),
+                min(glyph.bbox[0] for glyph in glyphs),
+                min(glyph.bbox[1] for glyph in glyphs),
+                max(glyph.bbox[2] for glyph in glyphs),
+                max(glyph.bbox[3] for glyph in glyphs),
             )
-            if values
-            else (0.0, 0.0, 0.0, 0.0)
+            if glyphs
+            else (
+                (
+                    min(line.x0 for line in values),
+                    min(line.top for line in values),
+                    max(line.x1 for line in values),
+                    max(line.bottom for line in values),
+                )
+                if values
+                else (0.0, 0.0, 0.0, 0.0)
+            )
         )
+        style_items = glyphs or [
+            PdfTextGlyph(
+                text=line.text,
+                bbox=(line.x0, line.top, line.x1, line.bottom),
+                font_name=line.font_name,
+                pdf_font_name=line.pdf_font_name,
+                font_size=line.font_size,
+                color=line.color,
+                bold=line.bold,
+                italic=line.italic,
+                rotation=line.rotation,
+                direction=line.direction,
+                z_order=line.z_order,
+                source_char_id=line.source_char_ids[0]
+                if line.source_char_ids
+                else "",
+            )
+            for line in values
+        ]
+        font_sizes = sorted(
+            glyph.font_size for glyph in style_items if glyph.font_size > 0
+        )
+        source_char_ids = tuple(
+            dict.fromkeys(
+                glyph.source_char_id
+                for glyph in style_items
+                if glyph.source_char_id
+            )
+        )
+        spans = _cell_spans_from_glyphs(style_items)
         cells.append(
             PdfTableCell(
                 row_index=row_index,
@@ -292,18 +435,18 @@ def _extract_table(
                 text=text,
                 text_bbox=text_bbox,
                 font_size=(
-                    sorted(line.font_size for line in values if line.font_size > 0)[
-                        len([item for item in values if item.font_size > 0]) // 2
-                    ]
-                    if any(line.font_size > 0 for line in values)
-                    else 0.0
+                    font_sizes[len(font_sizes) // 2] if font_sizes else 0.0
                 ),
-                bold=sum(line.bold for line in values) * 2 >= max(len(values), 1),
+                bold=sum(glyph.bold for glyph in style_items) * 2
+                >= max(len(style_items), 1),
                 alignment=(
                     Counter(line.alignment for line in values).most_common(1)[0][0]
                     if values
                     else "left"
                 ),
+                spans=spans,
+                glyphs=tuple(glyphs),
+                source_char_ids=source_char_ids,
             )
         )
 
@@ -313,6 +456,13 @@ def _extract_table(
         row_boundaries=row_boundaries,
         rows=tuple(tuple(row) for row in rows),
         cells=tuple(cells),
+        source_char_ids=tuple(
+            dict.fromkeys(
+                char_id
+                for cell in cells
+                for char_id in cell.source_char_ids
+            )
+        ),
     )
 
 
@@ -327,11 +477,23 @@ def _find_tables(
         _extract_table(lines, candidate)
         for candidate in candidates
     ]
-    return tuple(
-        table
-        for table in tables
-        if any(value for row in table.rows for value in row)
-    )
+    reliable: list[PdfTable] = []
+    for table in tables:
+        values = [value.strip() for row in table.rows for value in row if value.strip()]
+        if not values:
+            continue
+        total_cells = max(table.row_count * table.column_count, 1)
+        density = len(values) / total_cells
+        if table.column_count >= 4 and density < 0.18:
+            continue
+        if (
+            table.column_count >= 3
+            and table.row_count >= 3
+            and len(values) < table.row_count
+        ):
+            continue
+        reliable.append(table)
+    return tuple(reliable)
 
 
 def _column_width_ratios(table: PdfTable) -> tuple[float, ...]:
@@ -579,20 +741,28 @@ def _find_borderless_tables(
         column_count = len(run_anchors)
         if column_count < 2:
             continue
+        first_row_top = min(
+            line.top for _, matched in run for _, _, line in matched
+        )
+        has_caption = any(
+            _TABLE_CAPTION.match(line.text)
+            and line.bottom <= first_row_top + 4.0
+            and first_row_top - line.bottom <= 50.0
+            for line in candidates
+        )
+        numeric_rows = sum(
+            any(_is_numeric_table_cell(line.text) for _, _, line in matched)
+            for _, matched in run
+        )
+        if column_count > 8 and not has_caption:
+            continue
+        if len(run) > 40 and not has_caption:
+            continue
+        if not has_caption and numeric_rows < max(2, len(run) // 2):
+            continue
         if column_count == 2:
             if len(run) < 4:
                 continue
-            first_row_top = min(line.top for _, matched in run for _, _, line in matched)
-            has_caption = any(
-                _TABLE_CAPTION.match(line.text)
-                and line.bottom <= first_row_top + 4.0
-                and first_row_top - line.bottom <= 50.0
-                for line in candidates
-            )
-            numeric_rows = sum(
-                any(_is_numeric_table_cell(line.text) for _, _, line in matched)
-                for _, matched in run
-            )
             if not has_caption and numeric_rows < max(2, len(run) // 2):
                 continue
 
@@ -710,6 +880,7 @@ def _find_borderless_tables(
                 rows=tuple(table_rows),
                 cells=tuple(cells),
                 header_row_count=1,
+                has_borders=False,
             )
         )
     return tuple(tables)

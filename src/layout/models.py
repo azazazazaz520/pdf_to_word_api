@@ -65,6 +65,10 @@ class PdfTextGlyph:
     object_index: int = -1
     substituted: bool = False
     fallback_reason: str = ""
+    source_char_id: str = ""
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
+    font_matrix: tuple[float, float, float, float, float, float] = ()
 
     @property
     def x0(self) -> float:
@@ -117,6 +121,9 @@ class PdfTextSpan:
     fallback_reason: str = ""
     direction: tuple[float, float] = (1.0, 0.0)
     glyphs: tuple[PdfTextGlyph, ...] = ()
+    source_char_ids: tuple[str, ...] = ()
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
 
     @property
     def x0(self) -> float:
@@ -167,6 +174,9 @@ class PdfTextLine:
     font_fallback_reason: str = ""
     direction: tuple[float, float] = (1.0, 0.0)
     glyphs: tuple[PdfTextGlyph, ...] = ()
+    source_char_ids: tuple[str, ...] = ()
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
 
     @property
     def center_x(self) -> float:
@@ -206,6 +216,7 @@ class PdfTextBlock:
     parent_id: str | None = None
     region_id: str = ""
     needs_review: bool = False
+    source_char_ids: tuple[str, ...] = ()
 
     @property
     def text(self) -> str:
@@ -303,6 +314,9 @@ class PdfTableCell:
     font_size: float = 0.0
     bold: bool = False
     alignment: str = "left"
+    spans: tuple[PdfTextSpan, ...] = ()
+    glyphs: tuple[PdfTextGlyph, ...] = ()
+    source_char_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -321,6 +335,7 @@ class PdfTable:
     border_color: tuple[int, int, int] = (0, 0, 0)
     has_borders: bool = True
     z_order: int = 0
+    source_char_ids: tuple[str, ...] = ()
 
     @property
     def column_count(self) -> int:
@@ -337,6 +352,38 @@ class PdfTable:
             max(self.row_boundaries[index + 1] - self.row_boundaries[index], 0.0)
             for index in range(self.row_count)
         )
+
+
+@dataclass(frozen=True)
+class PdfLayoutRegion:
+    """页面区域契约，统一承载区域类型、坐标和字符归属。"""
+
+    region_id: str
+    page_number: int
+    kind: str
+    bbox: tuple[float, float, float, float]
+    confidence: float = 1.0
+    source: str = "geometry"
+    parent_region_id: str | None = None
+    column_id: str | None = None
+    order_hint: int | None = None
+    source_char_ids: tuple[str, ...] = ()
+    needs_review: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "region_id": self.region_id,
+            "page_number": self.page_number,
+            "kind": self.kind,
+            "bbox": [round(value, 3) for value in self.bbox],
+            "confidence": round(self.confidence, 4),
+            "source": self.source,
+            "parent_region_id": self.parent_region_id,
+            "column_id": self.column_id,
+            "order_hint": self.order_hint,
+            "source_char_ids": list(self.source_char_ids),
+            "needs_review": self.needs_review,
+        }
 
 
 @dataclass(frozen=True)
@@ -357,6 +404,7 @@ class PdfContentBlock:
     region_id: str = ""
     layer: str = "body"
     needs_review: bool = False
+    source_char_ids: tuple[str, ...] = ()
 
     @property
     def top(self) -> float:
@@ -399,6 +447,7 @@ class PdfPageLayout:
     content_blocks: tuple[PdfContentBlock, ...] = ()
     reading_order_confidence: float = 1.0
     reading_order_warnings: tuple[str, ...] = ()
+    regions: tuple[PdfLayoutRegion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -463,6 +512,10 @@ class _TextCharacter:
     direction: tuple[float, float] = (1.0, 0.0)
     char_index: int = -1
     object_index: int = -1
+    source_char_id: str = ""
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
+    font_matrix: tuple[float, float, float, float, float, float] = ()
 
     @property
     def center_x(self) -> float:
@@ -490,6 +543,9 @@ class _TextObjectStyle:
     fallback_reason: str = ""
     object_key: int = 0
     object_index: int = -1
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
+    font_matrix: tuple[float, float, float, float, float, float] = ()
 
     @property
     def area(self) -> float:

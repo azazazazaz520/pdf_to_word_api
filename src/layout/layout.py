@@ -41,6 +41,7 @@ import pypdfium2 as pdfium
 from ..fonts.resolver import FontMatch, PdfFontDescriptor, extract_pdf_font_descriptors
 from .models import PdfTable, PdfVectorObject
 from .reading_order import _detect_column_boundaries, _estimate_body_left
+from .regions import build_geometry_regions
 
 def extract_pdf_layout(
     source_pdf: Path,
@@ -88,6 +89,7 @@ def extract_pdf_layout(
                     text_page,
                     height,
                     styles=styles,
+                    page_number=page_number,
                 )
                 tables = _find_tables(page, lines, height)
                 tables = (
@@ -100,6 +102,9 @@ def extract_pdf_layout(
                     ),
                 )
                 tables = tuple(sorted(tables, key=lambda table: table.bbox[1]))
+                raw_vectors = _extract_vector_objects(page, height)
+                if len(raw_vectors) >= 300:
+                    tables = ()
                 if (
                     include_page_images is not None
                     and (page_number - 1) not in include_page_images
@@ -117,7 +122,7 @@ def extract_pdf_layout(
                 vectors: tuple[PdfVectorObject, ...] = ()
                 if include_fidelity:
                     vectors = _filter_table_border_vectors(
-                        _extract_vector_objects(page, height),
+                        raw_vectors,
                         tables,
                     )
             finally:
@@ -147,6 +152,22 @@ def extract_pdf_layout(
             ),
         )
         for page in updated_pages
+    )
+    updated_pages = tuple(
+        replace(
+            page,
+            regions=build_geometry_regions(
+                page_number=index + 1,
+                page_width=page.width,
+                page_height=page.height,
+                lines=page.lines,
+                tables=page.tables,
+                images=page.images,
+                vectors=page.vectors,
+                columns=page.columns,
+            ),
+        )
+        for index, page in enumerate(updated_pages)
     )
     if include_fidelity:
         updated_pages = tuple(

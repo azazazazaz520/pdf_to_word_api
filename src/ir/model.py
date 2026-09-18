@@ -45,6 +45,10 @@ class IRTextGlyph:
     object_index: int = -1
     substituted: bool = False
     fallback_reason: str = ""
+    source_char_id: str = ""
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
+    font_matrix: tuple[float, float, float, float, float, float] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +67,10 @@ class IRTextGlyph:
             "object_index": self.object_index,
             "font_substituted": self.substituted,
             "font_fallback_reason": self.fallback_reason,
+            "source_char_id": self.source_char_id,
+            "nominal_font_size": round(self.nominal_font_size, 3),
+            "font_size_source": self.font_size_source,
+            "font_matrix": list(self.font_matrix),
         }
 
 
@@ -84,6 +92,9 @@ class IRTextSpan:
     fallback_reason: str = ""
     direction: tuple[float, float] = (1.0, 0.0)
     glyphs: tuple[IRTextGlyph, ...] = ()
+    source_char_ids: tuple[str, ...] = ()
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
 
     @property
     def width(self) -> float:
@@ -105,6 +116,9 @@ class IRTextSpan:
             "font_substituted": self.substituted,
             "font_fallback_reason": self.fallback_reason,
             "glyphs": [glyph.to_dict() for glyph in self.glyphs],
+            "source_char_ids": list(self.source_char_ids),
+            "nominal_font_size": round(self.nominal_font_size, 3),
+            "font_size_source": self.font_size_source,
         }
 
 
@@ -135,6 +149,9 @@ class IRTextLine:
     fallback_reason: str = ""
     direction: tuple[float, float] = (1.0, 0.0)
     glyphs: tuple[IRTextGlyph, ...] = ()
+    source_char_ids: tuple[str, ...] = ()
+    nominal_font_size: float = 0.0
+    font_size_source: str = ""
 
     @property
     def width(self) -> float:
@@ -165,6 +182,9 @@ class IRTextLine:
             "font_fallback_reason": self.fallback_reason,
             "spans": [span.to_dict() for span in self.spans],
             "glyphs": [glyph.to_dict() for glyph in self.glyphs],
+            "source_char_ids": list(self.source_char_ids),
+            "nominal_font_size": round(self.nominal_font_size, 3),
+            "font_size_source": self.font_size_source,
         }
 
 
@@ -338,6 +358,7 @@ class IRPage:
     header_footer_native: bool = False
     reading_order_confidence: float | None = None
     reading_order_warnings: list[str] = field(default_factory=list)
+    regions: list[dict[str, Any]] = field(default_factory=list)
 
     def add_warning(self, warning: IRWarning) -> None:
         self.warnings.append(warning)
@@ -675,6 +696,8 @@ class IRDocument:
                     "rebuild_confidence": page.reconstruction_confidence,
                     "reading_order_confidence": page.reading_order_confidence,
                     "reading_order_warnings": list(page.reading_order_warnings),
+                    "region_count": len(page.regions),
+                    "regions": list(page.regions),
                     "warnings": page_warnings,
                 }
             )

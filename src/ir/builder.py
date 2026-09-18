@@ -168,6 +168,9 @@ def _ir_text_line(
             _ir_text_glyph(glyph)
             for glyph in getattr(line, "glyphs", ())
         ),
+        source_char_ids=tuple(getattr(line, "source_char_ids", ()) or ()),
+        nominal_font_size=float(getattr(line, "nominal_font_size", 0.0) or 0.0),
+        font_size_source=getattr(line, "font_size_source", ""),
     )
 
 
@@ -189,6 +192,10 @@ def _ir_text_glyph(glyph: Any) -> IRTextGlyph:
         object_index=int(getattr(glyph, "object_index", -1)),
         substituted=bool(getattr(glyph, "substituted", False)),
         fallback_reason=getattr(glyph, "fallback_reason", ""),
+        source_char_id=getattr(glyph, "source_char_id", ""),
+        nominal_font_size=float(getattr(glyph, "nominal_font_size", 0.0) or 0.0),
+        font_size_source=getattr(glyph, "font_size_source", ""),
+        font_matrix=tuple(getattr(glyph, "font_matrix", ()) or ()),
     )
 
 
@@ -212,6 +219,9 @@ def _ir_text_span(span: Any) -> IRTextSpan:
             _ir_text_glyph(glyph)
             for glyph in getattr(span, "glyphs", ())
         ),
+        source_char_ids=tuple(getattr(span, "source_char_ids", ()) or ()),
+        nominal_font_size=float(getattr(span, "nominal_font_size", 0.0) or 0.0),
+        font_size_source=getattr(span, "font_size_source", ""),
     )
 
 
@@ -244,6 +254,30 @@ def _apply_fidelity_style(
         0.0,
     )
     block.z_order = min(line.z_order for line in lines)
+    source_char_ids = tuple(
+        char_id
+        for line in lines
+        for char_id in getattr(line, "source_char_ids", ())
+    )
+    block.meta["source_char_ids"] = tuple(dict.fromkeys(source_char_ids))
+    block.meta["nominal_font_sizes"] = tuple(
+        sorted(
+            {
+                round(float(line.nominal_font_size), 3)
+                for line in lines
+                if float(getattr(line, "nominal_font_size", 0.0) or 0.0) > 0
+            }
+        )
+    )
+    block.meta["font_size_sources"] = tuple(
+        sorted(
+            {
+                line.font_size_source
+                for line in lines
+                if getattr(line, "font_size_source", "")
+            }
+        )
+    )
     left_edges = [line.x0 for line in lines]
     block.first_line_indent = max(lines[0].x0 - min(left_edges), 0.0)
     block.meta.setdefault("page_width", page_width)
@@ -300,6 +334,7 @@ def build_text_page_ir(
         editable=True,
         reading_order_confidence=page.reading_order_confidence,
         reading_order_warnings=list(page.reading_order_warnings),
+        regions=[region.to_dict() for region in getattr(page, "regions", ())],
     )
 
     body_lines = [line for line in page.lines if not line.is_header_footer]
@@ -358,6 +393,13 @@ def build_text_page_ir(
                 for index in span
                 if 0 <= index < len(text_lines)
             ]
+            block.meta["source_char_ids"] = tuple(
+                dict.fromkeys(
+                    char_id
+                    for source_line in source_lines
+                    for char_id in getattr(source_line, "source_char_ids", ())
+                )
+            )
             if fidelity:
                 _apply_fidelity_style(
                     block,
@@ -387,6 +429,9 @@ def build_text_page_ir(
             source="vector_table",
             confidence=confidence,
             z_order=getattr(table, "z_order", 0),
+        )
+        block.meta["source_char_ids"] = tuple(
+            getattr(table, "source_char_ids", ()) or ()
         )
         _apply_content_metadata(block, content_block)
         result.blocks.append(block)

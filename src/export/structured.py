@@ -905,8 +905,11 @@ def _record_placement(
         {
             "kind": block.kind,
             "page": block.page,
+            "block_id": block.block_id,
             "status": status,
             "reason": reason,
+            "source_char_ids": list(block.meta.get("source_char_ids", ())),
+            "source_text": block.text,
         }
     )
 

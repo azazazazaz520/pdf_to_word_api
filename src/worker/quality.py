@@ -6,6 +6,134 @@
 from __future__ import annotations
 
 from typing import Any
+from pathlib import Path
+import zipfile
+import xml.etree.ElementTree as ET
+
+
+def _check_status(
+    name: str,
+    status: str,
+    detail: str,
+    *,
+    required: bool = True,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": status,
+        "detail": detail,
+        "required": required,
+    }
+
+
+def evaluate_final_content_quality(
+    *,
+    source_char_ids: list[str] | tuple[str, ...] | set[str],
+    placements: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    source_text: str = "",
+    output_text: str = "",
+) -> dict[str, Any]:
+    """独立核对源字符与最终导出归属，缺少证据时返回未验证。"""
+    source_ids = {str(value) for value in source_char_ids if str(value)}
+    output_ids = [
+        str(char_id)
+        for placement in placements
+        for char_id in placement.get("source_char_ids", ())
+        if str(char_id)
+    ]
+    checks: list[dict[str, Any]] = []
+    if source_ids and output_ids:
+        output_set = set(output_ids)
+        missing = sorted(source_ids - output_set)
+        duplicates = sorted(
+            char_id
+            for char_id in set(output_ids)
+            if output_ids.count(char_id) > 1
+        )
+        checks.append(
+            _check_status(
+                "source_character_coverage",
+                "failed" if missing else "passed",
+                f"missing={missing[:20]}",
+            )
+        )
+        checks.append(
+            _check_status(
+                "source_character_unique_placement",
+                "failed" if duplicates else "passed",
+                f"duplicates={duplicates[:20]}",
+            )
+        )
+    else:
+        checks.extend(
+            (
+                _check_status(
+                    "source_character_coverage",
+                    "unverified",
+                    "缺少源字符或最终 DOCX 归属映射",
+                ),
+                _check_status(
+                    "source_character_unique_placement",
+                    "unverified",
+                    "缺少最终 DOCX 归属映射",
+                ),
+            )
+        )
+
+    normalized_source = "".join(str(source_text).split())
+    normalized_output = "".join(str(output_text).split())
+    if normalized_source and normalized_output:
+        text_status = (
+            "passed"
+            if normalized_source in normalized_output
+            else "failed"
+            if len(normalized_output) < len(normalized_source) * 0.99
+            else "unverified"
+        )
+        checks.append(
+            _check_status(
+                "text_content_presence",
+                text_status,
+                f"source_length={len(normalized_source)}, output_length={len(normalized_output)}",
+            )
+        )
+    else:
+        checks.append(
+            _check_status(
+                "text_content_presence",
+                "unverified",
+                "缺少独立的源文本或回读文本",
+            )
+        )
+    required_statuses = [item["status"] for item in checks if item["required"]]
+    if "failed" in required_statuses:
+        status = "failed"
+    elif "unverified" in required_statuses:
+        status = "unverified"
+    else:
+        status = "passed"
+    return {
+        "status": status,
+        "checks": checks,
+        "source_character_count": len(source_ids),
+        "output_character_mapping_count": len(output_ids),
+    }
+
+
+def read_docx_text(path: Path) -> str:
+    """从最终 DOCX XML 回读可见文字，供内容门禁独立取证。"""
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    texts: list[str] = []
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not name.startswith("word/") or not name.endswith(".xml"):
+                continue
+            root = ET.fromstring(archive.read(name))
+            texts.extend(
+                node.text or ""
+                for node in root.iter(f"{namespace}t")
+            )
+    return "".join(texts)
 
 
 
@@ -132,9 +260,24 @@ def _evaluate_quality_gate(
                 ),
             }
         )
-    status = "passed" if all(
-        check["status"] == "passed" for check in checks
-    ) else "failed"
+    final_content = quality.get("final_content")
+    if isinstance(final_content, dict) and final_content.get("status") not in {
+        "not_applicable",
+        None,
+    }:
+        checks.append(
+            {
+                "name": "final_content",
+                "status": final_content.get("status", "unverified"),
+                "detail": "最终 DOCX 内容归属与回读检查",
+            }
+        )
+    if any(check["status"] == "failed" for check in checks):
+        status = "failed"
+    elif any(check["status"] == "unverified" for check in checks):
+        status = "unverified"
+    else:
+        status = "passed"
     return {
         "status": status,
         "checks": checks,

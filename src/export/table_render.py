@@ -10,7 +10,7 @@ from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_ROW_HEIGHT_RULE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, RGBColor
 from ..layout.models import PdfTable
 
 
@@ -78,6 +78,7 @@ def _set_pdf_cell_content(
     bold: bool = False,
     alignment: str = "",
     vertical_alignment: str = "center",
+    spans: tuple[Any, ...] = (),
 ) -> None:
     """设置 PDF 表格单元格的宽度、对齐方式和文本格式。"""
     cell.width = Inches(width)
@@ -86,7 +87,7 @@ def _set_pdf_cell_content(
         if vertical_alignment == "top"
         else WD_CELL_VERTICAL_ALIGNMENT.CENTER
     )
-    cell.text = text
+    cell.text = ""
     alignments = {
         "left": WD_ALIGN_PARAGRAPH.LEFT,
         "center": WD_ALIGN_PARAGRAPH.CENTER,
@@ -98,15 +99,30 @@ def _set_pdf_cell_content(
         paragraph.paragraph_format.space_before = Pt(0)
         if alignment in alignments:
             paragraph.alignment = alignments[alignment]
-        if is_header:
-            for run in paragraph.runs:
+        if spans:
+            for span in spans:
+                run = paragraph.add_run(str(getattr(span, "text", "")))
+                span_font = str(getattr(span, "font_name", "") or "")
+                if span_font:
+                    run.font.name = span_font
+                span_size = float(getattr(span, "font_size", 0.0) or 0.0)
+                if span_size > 0:
+                    run.font.size = Pt(span_size)
+                run.bold = bool(getattr(span, "bold", False)) or is_header or bold
+                run.italic = bool(getattr(span, "italic", False))
+                color = getattr(span, "color", None)
+                if color and len(color) >= 3:
+                    run.font.color.rgb = RGBColor(
+                        int(color[0]) & 0xFF,
+                        int(color[1]) & 0xFF,
+                        int(color[2]) & 0xFF,
+                    )
+        else:
+            run = paragraph.add_run(text)
+            if is_header or bold:
                 run.bold = True
-        if font_size and font_size > 0:
-            for run in paragraph.runs:
+            if font_size and font_size > 0:
                 run.font.size = Pt(font_size)
-        if bold:
-            for run in paragraph.runs:
-                run.bold = True
 
 
 def _cell_lookup(
@@ -256,6 +272,7 @@ def _add_pdf_table(
                 bold=pdf_cell.bold,
                 alignment=pdf_cell.alignment,
                 vertical_alignment=cell_vertical_alignment,
+                spans=pdf_cell.spans,
             )
     else:
         for row_index, values in enumerate(all_rows):

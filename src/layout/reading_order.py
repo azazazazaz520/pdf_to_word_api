@@ -509,6 +509,13 @@ def _text_block_from_lines(
         ),
         rotation=_dominant_rotation(lines),
         is_header_footer=all(line.is_header_footer for line in lines),
+        source_char_ids=tuple(
+            dict.fromkeys(
+                char_id
+                for line in lines
+                for char_id in getattr(line, "source_char_ids", ())
+            )
+        ),
     )
 
 
@@ -747,6 +754,7 @@ def _build_content_blocks(
                 region_id=block.region_id,
                 layer=_content_block_layer(block.block_type),
                 needs_review=block.needs_review,
+                source_char_ids=block.source_char_ids,
             )
         )
     for index, table in enumerate(tables):
@@ -763,6 +771,7 @@ def _build_content_blocks(
                     page_width=page_width,
                     config=config,
                 ),
+                source_char_ids=table.source_char_ids,
             )
         )
     for index, image in enumerate(images):
@@ -780,6 +789,7 @@ def _build_content_blocks(
                     config=config,
                 ),
                 layer=image.layer,
+                source_char_ids=(),
             )
         )
     for index, vector in enumerate(vectors):
@@ -797,6 +807,7 @@ def _build_content_blocks(
                     config=config,
                 ),
                 layer=vector.layer,
+                source_char_ids=(),
             )
         )
     return _sort_content_blocks_in_reading_order(

@@ -318,9 +318,12 @@ def _record_placement(
         {
             "kind": block.kind,
             "layer": block.layer,
+            "block_id": block.block_id,
             "status": status,
             "reason": reason,
             "bbox": [round(value, 2) for value in region] if region else None,
+            "source_char_ids": list(block.meta.get("source_char_ids", ())),
+            "source_text": block.text,
         }
     )
     if status == "native":

@@ -697,6 +697,49 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 stage_callback=emit_export_stage,
             )
             quality["fidelity"] = fidelity_report
+        source_blocks = [
+            block
+            for page in ir.pages
+            for block in page.blocks
+            if not str(block.source).startswith("header_footer")
+        ]
+        source_char_ids = tuple(
+            dict.fromkeys(
+                char_id
+                for block in source_blocks
+                for char_id in block.meta.get("source_char_ids", ())
+            )
+        )
+        export_report = quality.get("structured") or quality.get("fidelity") or {}
+        placements = list(export_report.get("placements") or [])
+        if not placements:
+            placements = [
+                placement
+                for page_report in export_report.get("pages", [])
+                for placement in page_report.get("placements", [])
+            ]
+        source_text = "".join(block.text for block in source_blocks if block.text)
+        try:
+            output_text = read_docx_text(output_path)
+        except Exception as error:
+            output_text = ""
+            quality["content_readback_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+        if source_char_ids:
+            quality["final_content"] = evaluate_final_content_quality(
+                source_char_ids=source_char_ids,
+                placements=placements,
+                source_text=source_text,
+                output_text=output_text,
+            )
+        else:
+            quality["final_content"] = {
+                "status": "not_applicable",
+                "checks": [],
+                "source_character_count": 0,
+                "output_character_mapping_count": 0,
+            }
         font_usage_report = ir.font_usage()
         font_plan_report = font_plan.report() if font_plan is not None else None
         quality["fonts"] = {
@@ -841,4 +884,6 @@ from .worker.quality import (  # noqa: F401  # 保持原导入路径可用
     _apply_fidelity_acceptance,
     _evaluate_quality_gate,
     _merge_render_validation,
+    evaluate_final_content_quality,
+    read_docx_text,
 )

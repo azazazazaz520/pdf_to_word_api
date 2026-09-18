@@ -237,19 +237,29 @@ def _extract_object_styles(
                 substituted = False
                 fallback_reason = ""
             rotation = 0.0
+            matrix_values_tuple: tuple[float, float, float, float, float, float] = ()
             matrix_scale = 1.0
             try:
                 matrix = page_object.get_matrix()
                 matrix_values = list(matrix.get())
+                if len(matrix_values) >= 6:
+                    matrix_values_tuple = tuple(
+                        float(value) for value in matrix_values[:6]
+                    )
                 rotation = _matrix_rotation(matrix)
                 matrix_scale = _matrix_scale(matrix_values)
             except Exception:
                 rotation = 0.0
                 matrix_scale = 1.0
             try:
-                font_size = float(page_object.get_font_size()) * matrix_scale
+                nominal_font_size = float(page_object.get_font_size())
+                font_size = nominal_font_size * matrix_scale
             except Exception:
-                font_size = max(bbox[3] - bbox[1], 1.0)
+                nominal_font_size = max(bbox[3] - bbox[1], 1.0)
+                font_size = nominal_font_size
+                font_size_source = "character_geometry"
+            else:
+                font_size_source = "object_font_matrix"
             color = _object_fill_color(page_object) or (0, 0, 0)
             styles.append(
                 _TextObjectStyle(
@@ -266,6 +276,9 @@ def _extract_object_styles(
                     fallback_reason=fallback_reason,
                     object_key=object_key,
                     object_index=index,
+                    nominal_font_size=max(nominal_font_size, 0.0),
+                    font_size_source=font_size_source,
+                    font_matrix=matrix_values_tuple,
                 )
             )
         finally:
@@ -276,21 +289,32 @@ def _extract_object_styles(
 
 
 def _matrix_scale(matrix_values: Any) -> float:
-    """从文本矩阵中提取有效缩放，修正 PDF 里被缩放绘制的字号。"""
+    """从文本矩阵中提取文字高度缩放，修正 PDF 中被缩放绘制的字号。"""
     try:
         values = list(matrix_values)
     except TypeError:
         return 1.0
     if len(values) < 4:
         return 1.0
-    a, b, c, d = (float(value) for value in values[:4])
-    determinant = abs(a * d - b * c)
-    if determinant <= 1e-9:
-        return 1.0
-    scale = math.sqrt(determinant)
-    if scale <= 1e-6:
+    _, _, c, d = (float(value) for value in values[:4])
+    scale = math.hypot(c, d)
+    if scale <= 1e-9:
         return 1.0
     return max(min(scale, 20.0), 0.01)
+
+
+def _matrix_scales(
+    matrix_values: Any,
+) -> tuple[float, float]:
+    """返回文字方向和文字高度方向的独立缩放。"""
+    try:
+        values = list(matrix_values)
+        if len(values) < 4:
+            return 1.0, 1.0
+        a, b, c, d = (float(value) for value in values[:4])
+    except (TypeError, ValueError):
+        return 1.0, 1.0
+    return max(math.hypot(a, b), 0.01), max(math.hypot(c, d), 0.01)
 
 
 def _matrix_rotation(matrix: Any) -> float:
@@ -507,6 +531,7 @@ def _extract_text_characters(
     page_height: float,
     *,
     styles: list[_TextObjectStyle] | None = None,
+    page_number: int = 1,
 ) -> list[_TextCharacter]:
     characters: list[_TextCharacter] = []
     style_index = _style_index(styles) if styles else {}
@@ -547,6 +572,9 @@ def _extract_text_characters(
             rotation=rotation,
             direction=direction,
             char_index=index,
+            source_char_id=f"{page_number}:{index}",
+            nominal_font_size=raw_font_size or height,
+            font_size_source="character_metrics" if raw_font_size > 0.2 else "character_geometry",
         )
         if styles:
             style = _style_for_character(
@@ -571,7 +599,10 @@ def _extract_text_characters(
                 character.pdf_font_name = style.pdf_font_name
                 character.font_substituted = style.substituted
                 character.font_fallback_reason = style.fallback_reason
-                if raw_font_size <= 0.2 and style.font_size > 0.2:
+                character.nominal_font_size = style.nominal_font_size or character.nominal_font_size
+                character.font_size_source = style.font_size_source or character.font_size_source
+                character.font_matrix = style.font_matrix
+                if style.font_size > 0.0:
                     character.font_size = style.font_size
         characters.append(character)
     return characters
@@ -720,10 +751,17 @@ def _split_geometry_row(
     previous_end = None
     for character in ordered:
         start, end = _projected_extent(character, direction)
-        if current and previous_end is not None and start - previous_end > split_gap:
+        if (
+            current
+            and previous_end is not None
+            and start - previous_end > split_gap
+            and not character.text.isspace()
+        ):
             runs.append(current)
             current = []
         current.append(character)
+        if _is_point_like(character) and character.text.isspace():
+            continue
         previous_end = end if previous_end is None else max(previous_end, end)
     if current:
         runs.append(current)
@@ -745,6 +783,7 @@ def _geometry_character_groups(
                 character,
             )
             for character in oriented
+            if not (_is_point_like(character) and character.text.isspace())
         )
         rows: list[list[_TextCharacter]] = []
         row_centers: list[float] = []
@@ -781,6 +820,67 @@ def _geometry_character_groups(
                 row_sizes[best_index] = max(
                     row_sizes[best_index], size
                 )
+        row_for_character = {
+            id(character): row_index
+            for row_index, row in enumerate(rows)
+            for character in row
+        }
+        for character in oriented:
+            if not (_is_point_like(character) and character.text.isspace()):
+                continue
+            neighbours = sorted(
+                (
+                    abs(character.char_index - other.char_index),
+                    other.char_index,
+                    other,
+                )
+                for other in oriented
+                if not (_is_point_like(other) and other.text.isspace())
+                and other.char_index >= 0
+                and character.char_index >= 0
+                and other.char_index != character.char_index
+            )
+            if not neighbours:
+                continue
+            if not rows:
+                continue
+            previous = next(
+                (item[2] for item in neighbours if item[1] < character.char_index),
+                None,
+            )
+            following = next(
+                (item[2] for item in neighbours if item[1] > character.char_index),
+                None,
+            )
+            if previous is not None and following is not None:
+                font_scale = max(
+                    float(previous.font_size or 0.0),
+                    float(following.font_size or 0.0),
+                    1.0,
+                )
+                left_gap = max(character.x0 - previous.x1, 0.0)
+                right_gap = max(following.x0 - character.x1, 0.0)
+                if max(left_gap, right_gap) > max(font_scale * 2.5, 8.0):
+                    continue
+            candidate_rows = [
+                row_for_character[id(item)]
+                for item in (previous, following)
+                if item is not None and id(item) in row_for_character
+            ]
+            target_row = None
+            if candidate_rows and len(set(candidate_rows)) == 1:
+                target_row = candidate_rows[0]
+            elif candidate_rows:
+                target_row = candidate_rows[0]
+            else:
+                target_row = min(
+                    range(len(rows)),
+                    key=lambda index: abs(
+                        _projection(character, normal) - row_centers[index]
+                    ),
+                )
+            if target_row is not None:
+                rows[target_row].append(character)
         for row in rows:
             row_rotation = _mean_rotation(row)
             for run in _split_geometry_row(row, row_rotation):
@@ -900,6 +1000,10 @@ def _glyph_from_character(character: _TextCharacter) -> PdfTextGlyph:
         object_index=character.object_index,
         substituted=character.font_substituted,
         fallback_reason=character.font_fallback_reason,
+        source_char_id=character.source_char_id,
+        nominal_font_size=character.nominal_font_size,
+        font_size_source=character.font_size_source,
+        font_matrix=character.font_matrix,
     )
 
 
@@ -949,6 +1053,15 @@ def _build_text_line(
             dominant_span.fallback_reason if dominant_span else ""
         ),
         glyphs=glyphs,
+        source_char_ids=tuple(
+            glyph.source_char_id for glyph in glyphs if glyph.source_char_id
+        ),
+        nominal_font_size=(
+            dominant_span.nominal_font_size if dominant_span else 0.0
+        ),
+        font_size_source=(
+            dominant_span.font_size_source if dominant_span else ""
+        ),
     )
 
 
@@ -1124,6 +1237,13 @@ def _build_text_spans(
                 substituted=representative.font_substituted,
                 fallback_reason=representative.font_fallback_reason,
                 glyphs=tuple(_glyph_from_character(item) for item in group),
+                source_char_ids=tuple(
+                    item.source_char_id
+                    for item in group
+                    if item.source_char_id
+                ),
+                nominal_font_size=representative.nominal_font_size,
+                font_size_source=representative.font_size_source,
             )
         )
     return tuple(spans)
@@ -1294,11 +1414,13 @@ def _extract_text_lines(
     page_height: float,
     *,
     styles: list[_TextObjectStyle] | None = None,
+    page_number: int = 1,
 ) -> list[PdfTextLine]:
     characters = _extract_text_characters(
         text_page,
         page_height,
         styles=styles,
+        page_number=page_number,
     )
     lines: list[PdfTextLine] = []
     for rotation, group in _geometry_character_groups(characters):
