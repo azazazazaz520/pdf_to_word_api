@@ -21,7 +21,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ..ir.model import IRBlock, IRDocument, IRPage, IRTextLine, IRWarning
 from ..fonts.embedding import FontPlan, attach_embedded_fonts, measure_text_width
@@ -52,7 +52,7 @@ from .document_setup import (
     _set_document_styles,
     _set_section_page,
 )
-from .table_render import _add_pdf_table
+from .table_render import _add_pdf_table, _table_rows_needing_reflow
 
 from .document_setup import render_pdf_region
 
@@ -791,6 +791,344 @@ def _table_text_padding(
     return left, top
 
 
+def _is_irregular_form_table(table_data: Any) -> bool:
+    """按网格合并和字段长度识别需要局部保真的表单区域。"""
+    cells = list(getattr(table_data, "cells", ()) or ())
+    if not cells:
+        return False
+    merged_count = sum(
+        1
+        for cell in cells
+        if int(getattr(cell, "row_span", 1) or 1) > 1
+        or int(getattr(cell, "column_span", 1) or 1) > 1
+    )
+    merge_ratio = merged_count / len(cells)
+    max_text_length = max(
+        (len(str(getattr(cell, "text", "") or "").strip()) for cell in cells),
+        default=0,
+    )
+    dot_leader_cell_count = sum(
+        1
+        for cell in cells
+        if str(getattr(cell, "text", "") or "").count(".") >= 3
+        and not any(
+            character.isalnum()
+            for character in str(getattr(cell, "text", "") or "")
+        )
+    )
+    return (
+        int(getattr(table_data, "column_count", 0) or 0) >= 15
+        or (merge_ratio >= 0.5 and max_text_length >= 60)
+        or (len(getattr(table_data, "rows", ()) or ()) >= 10 and dot_leader_cell_count >= 5)
+        or (
+            len(getattr(table_data, "rows", ()) or ()) <= 2
+            and int(getattr(table_data, "column_count", 0) or 0) >= 8
+            and len(cells) >= 10
+            and max_text_length >= 40
+        )
+    )
+
+
+def _table_cell_text_lines(cell: Any) -> tuple[tuple[str, tuple[float, float, float, float], Any], ...]:
+    """按单元格字形的基线拆分文字，同时保留单元格内的字体样式。"""
+    result: list[tuple[str, tuple[float, float, float, float], Any]] = []
+    spans = tuple(getattr(cell, "spans", ()) or ())
+    for span in spans:
+        glyphs = tuple(getattr(span, "glyphs", ()) or ())
+        if not glyphs:
+            text = str(getattr(span, "text", "") or "")
+            bbox = getattr(span, "bbox", None)
+            if text.strip() and bbox is not None:
+                result.append((text, tuple(float(value) for value in bbox), span))
+            continue
+        groups: list[list[Any]] = []
+        centers: list[float] = []
+        for glyph in sorted(glyphs, key=lambda item: (item.bbox[1], item.bbox[0])):
+            center_y = (float(glyph.bbox[1]) + float(glyph.bbox[3])) / 2.0
+            group_index = next(
+                (
+                    index
+                    for index, center in enumerate(centers)
+                    if abs(center_y - center) <= 2.5
+                ),
+                None,
+            )
+            if group_index is None:
+                centers.append(center_y)
+                groups.append([glyph])
+            else:
+                groups[group_index].append(glyph)
+                centers[group_index] = sum(
+                    (float(item.bbox[1]) + float(item.bbox[3])) / 2.0
+                    for item in groups[group_index]
+                ) / len(groups[group_index])
+        for group in sorted(groups, key=lambda items: min(item.bbox[1] for item in items)):
+            ordered = sorted(group, key=lambda item: item.bbox[0])
+            text = "".join(str(item.text or "") for item in ordered)
+            if not text.strip():
+                continue
+            bbox = (
+                min(float(item.bbox[0]) for item in ordered),
+                min(float(item.bbox[1]) for item in ordered),
+                max(float(item.bbox[2]) for item in ordered),
+                max(float(item.bbox[3]) for item in ordered),
+            )
+            result.append((text, bbox, span))
+    if result:
+        return tuple(result)
+    glyphs = tuple(getattr(cell, "glyphs", ()) or ())
+    if not glyphs:
+        return ()
+    ordered = sorted(glyphs, key=lambda item: item.bbox[0])
+    return (
+        (
+            "".join(str(item.text or "") for item in ordered),
+            (
+                min(float(item.bbox[0]) for item in ordered),
+                min(float(item.bbox[1]) for item in ordered),
+                max(float(item.bbox[2]) for item in ordered),
+                max(float(item.bbox[3]) for item in ordered),
+            ),
+            ordered[0],
+        ),
+    )
+
+
+def _table_background_without_text(
+    context: _FidelityContext,
+    page: IRPage,
+    block: IRBlock,
+    table_data: Any,
+) -> bytes | None:
+    """渲染表单背景并擦除单元格文字，保留底色、边框和复选框。"""
+    if context.source_pdf is None or block.bbox is None:
+        return None
+    raw = _region_image_bytes(context, page, block)
+    if not raw:
+        return None
+    image = Image.open(BytesIO(raw)).convert("RGB")
+    region = tuple(float(value) for value in block.bbox)
+    scale_x = image.width / max(region[2] - region[0], 1.0)
+    scale_y = image.height / max(region[3] - region[1], 1.0)
+    draw = ImageDraw.Draw(image)
+    for cell in tuple(getattr(table_data, "cells", ()) or ()):
+        cell_bbox = tuple(float(value) for value in cell.bbox[:4])
+        cell_left = int(
+            max(0.0, (cell_bbox[0] - region[0]) * scale_x) + 2.0
+        )
+        cell_top = int(
+            max(0.0, (cell_bbox[1] - region[1]) * scale_y) + 2.0
+        )
+        cell_right = int(
+            min(float(image.width), (cell_bbox[2] - region[0]) * scale_x) - 2.0
+        )
+        cell_bottom = int(
+            min(float(image.height), (cell_bbox[3] - region[1]) * scale_y) - 2.0
+        )
+        if cell_right <= cell_left or cell_bottom <= cell_top:
+            continue
+        background = Counter(
+            image.crop((cell_left, cell_top, cell_right, cell_bottom)).getdata()
+        ).most_common(1)
+        if not background:
+            continue
+        background_color = background[0][0]
+        for _, raw_bbox, _ in _table_cell_text_lines(cell):
+            text_left, text_top, text_right, text_bottom = (
+                float(value) for value in raw_bbox
+            )
+            mask_left = max(cell_bbox[0] + 0.6, text_left - 0.3)
+            mask_top = max(cell_bbox[1] + 0.6, text_top - 0.3)
+            mask_right = min(cell_bbox[2] - 0.6, text_right + 0.3)
+            mask_bottom = min(cell_bbox[3] - 0.6, text_bottom + 0.3)
+            if mask_right <= mask_left or mask_bottom <= mask_top:
+                continue
+            draw.rectangle(
+                (
+                    (mask_left - region[0]) * scale_x,
+                    (mask_top - region[1]) * scale_y,
+                    (mask_right - region[0]) * scale_x,
+                    (mask_bottom - region[1]) * scale_y,
+                ),
+                fill=background_color,
+            )
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=92, optimize=False)
+    return output.getvalue()
+
+
+def _place_editable_form_table(
+    context: _FidelityContext,
+    canvas: Any,
+    page: IRPage,
+    block: IRBlock,
+    *,
+    report: dict[str, Any],
+) -> bool:
+    """用合并单元格边界和绝对文本重建无法流式容纳的复杂表单。"""
+    table_data = block.table
+    cells = tuple(getattr(table_data, "cells", ()) or ())
+    if not cells:
+        return False
+
+    text_z_order = block.z_order
+    background_image = _table_background_without_text(
+        context,
+        page,
+        block,
+        table_data,
+    )
+    if background_image is not None:
+        scaled = context.scaled_bbox(block.bbox)
+        if scaled is None:
+            return False
+        background_z_order = max(block.z_order + 1, 2)
+        text_z_order = background_z_order + 1
+        add_absolute_picture(
+            canvas.container,
+            background_image,
+            x_points=scaled[0],
+            y_points=scaled[1],
+            width_points=max(scaled[2] - scaled[0], 0.5),
+            height_points=max(scaled[3] - scaled[1], 0.5),
+            z_order=background_z_order,
+            object_id=context.next_object_id(),
+            name=f"form_table_background_{page.page_number}",
+            behind_text=False,
+            paragraph=canvas.paragraph,
+        )
+        report["editable_form_table_background_count"] = report.get(
+            "editable_form_table_background_count", 0
+        ) + 1
+    else:
+        line_color = rgb_to_hex(getattr(table_data, "border_color", None))
+        line_width = max(
+            float(getattr(table_data, "border_width", 0.0) or 0.0),
+            0.5,
+        )
+        seen_edges: set[tuple[str, float, float, float]] = set()
+        edge_count = 0
+        if bool(getattr(table_data, "has_borders", True)):
+            for cell in cells:
+                x0, top, x1, bottom = (
+                    float(value) for value in tuple(cell.bbox)[:4]
+                )
+                edges = (
+                    ("h", top, x0, x1),
+                    ("h", bottom, x0, x1),
+                    ("v", x0, top, bottom),
+                    ("v", x1, top, bottom),
+                )
+                for direction, fixed, start, end in edges:
+                    key = (
+                        direction,
+                        round(fixed, 3),
+                        round(min(start, end), 3),
+                        round(max(start, end), 3),
+                    )
+                    if key in seen_edges or abs(end - start) < 0.2:
+                        continue
+                    seen_edges.add(key)
+                    if direction == "h":
+                        x_points = min(start, end) * context.scale_x
+                        y_points = fixed * context.scale_y
+                        width_points = max(abs(end - start) * context.scale_x, 0.4)
+                        height_points = line_width
+                        flip_h = False
+                        flip_v = False
+                    else:
+                        x_points = fixed * context.scale_x
+                        y_points = min(start, end) * context.scale_y
+                        width_points = line_width
+                        height_points = max(abs(end - start) * context.scale_y, 0.4)
+                        flip_h = False
+                        flip_v = False
+                    add_absolute_shape(
+                        context.document,
+                        geometry="line",
+                        x_points=x_points,
+                        y_points=y_points,
+                        width_points=width_points,
+                        height_points=height_points,
+                        line_color=line_color,
+                        line_width_points=line_width,
+                        z_order=block.z_order - 1,
+                        behind_text=False,
+                        object_id=context.next_object_id(),
+                        name=f"form_table_edge_{page.page_number}_{edge_count}",
+                        paragraph=canvas.paragraph,
+                        flip_h=flip_h,
+                        flip_v=flip_v,
+                    )
+                    edge_count += 1
+
+    text_items = [
+        (text, raw_bbox, style, cell)
+        for cell in cells
+        for text, raw_bbox, style in _table_cell_text_lines(cell)
+    ]
+    if not text_items:
+        return False
+    text_paragraph = context.document.add_paragraph()
+    make_flow_paragraph_minimal(text_paragraph)
+    text_count = 0
+    for text, raw_bbox, style, cell in text_items:
+        bbox = context.scaled_bbox(raw_bbox)
+        if bbox is None:
+            continue
+        font_size = float(
+            getattr(style, "font_size", 0.0)
+            or getattr(cell, "font_size", 0.0)
+            or 8.0
+        )
+        font_name, bold, italic = _planned_font(
+            context,
+            str(getattr(style, "pdf_font_name", "") or ""),
+            str(getattr(style, "font_name", "") or "")
+            or FIDELITY_DEFAULT_FONT,
+            bool(getattr(style, "bold", False)),
+            bool(getattr(style, "italic", False)),
+        )
+        origin_x, origin_y = _fidelity_text_origin(
+            bbox,
+            font_size,
+            scale_x=context.scale_x,
+            scale_y=context.scale_y,
+            font_name=font_name,
+            offsets=context.font_offsets,
+        )
+        add_absolute_text_box(
+            context.document,
+            x_points=origin_x,
+            y_points=origin_y,
+            width_points=max(bbox[2] - bbox[0] + 1.0, 4.0),
+            height_points=max(bbox[3] - bbox[1] + 1.0, font_size * 1.2),
+            text=text,
+            font_name=font_name,
+            font_size=font_size,
+            bold=bold,
+            italic=italic,
+            color=getattr(style, "color", None),
+            alignment="left",
+            z_order=text_z_order,
+            object_id=context.next_object_id(),
+            name=f"form_table_text_{page.page_number}_{text_count}",
+            paragraph=text_paragraph,
+        )
+        text_count += 1
+
+    if text_count == 0:
+        return False
+    report["editable_form_table_count"] = report.get(
+        "editable_form_table_count", 0
+    ) + 1
+    report["editable_form_text_count"] = report.get(
+        "editable_form_text_count", 0
+    ) + text_count
+    _record_placement(report, block, status="native", reason="positioned_form_table")
+    return True
+
+
 def _place_table_block(
     context: _FidelityContext,
     canvas: Any,
@@ -815,6 +1153,24 @@ def _place_table_block(
         return
     padding = _table_text_padding(table_data)
     try:
+        if _is_irregular_form_table(table_data):
+            reflow_rows = _table_rows_needing_reflow(
+                table_data,
+                row_offset=len(
+                    getattr(table_data, "continuation_header_rows", ()) or ()
+                ),
+                cell_padding_points=padding,
+            )
+            if reflow_rows:
+                if _place_editable_form_table(
+                    context,
+                    canvas,
+                    page,
+                    block,
+                    report=report,
+                ):
+                    return
+                raise ValueError("table_text_does_not_fit_exact_row_heights")
         table = _add_pdf_table(
             context.document,
             table_data,
@@ -823,6 +1179,7 @@ def _place_table_block(
             cell_vertical_alignment="top",
             tight_cell_margins=True,
             cell_padding_points=padding,
+            exact_row_heights=True,
         )
         if table is None:
             raise ValueError("empty table")
@@ -834,13 +1191,16 @@ def _place_table_block(
         )
         make_flow_paragraph_minimal(context.document.add_paragraph())
     except Exception as error:
+        reason = f"table_rebuild_failed:{type(error).__name__}"
+        if str(error).strip():
+            reason = f"{reason}:{str(error).strip()}"
         _place_region_fallback(
             context,
             canvas,
             page,
             block,
             report=report,
-            reason=f"table_rebuild_failed:{type(error).__name__}",
+            reason=reason,
             behind_text=behind_text,
         )
         return
@@ -967,6 +1327,21 @@ def _is_white_fill(block: IRBlock) -> bool:
         return all(int(channel) >= 250 for channel in color[:3])
     except Exception:
         return False
+
+
+def _is_fill_only_rect(block: IRBlock) -> bool:
+    """判断矢量块是否是可置于文字下方的纯填充矩形。"""
+    vector = block.vector
+    if vector is None:
+        return False
+    return (
+        str(getattr(vector, "kind", "")) == "rect"
+        and bool(getattr(vector, "closed", False))
+        and bool(getattr(vector, "filled", False))
+        and not bool(getattr(vector, "stroked", False))
+        and getattr(vector, "fill_color", None) is not None
+        and getattr(vector, "stroke_color", None) is None
+    )
 
 
 def _place_fidelity_block(
@@ -1156,6 +1531,39 @@ def _can_place_header_footer_item(block: IRBlock) -> bool:
     if block.kind == "vector":
         return block.vector is not None and block.bbox is not None
     return False
+
+
+def _bbox_overlap_area(
+    left: tuple[float, float, float, float] | None,
+    right: tuple[float, float, float, float] | None,
+) -> float:
+    if left is None or right is None:
+        return 0.0
+    return max(min(left[2], right[2]) - max(left[0], right[0]), 0.0) * max(
+        min(left[3], right[3]) - max(left[1], right[1]),
+        0.0,
+    )
+
+
+def _filled_vector_is_behind_text(block: IRBlock, page: IRPage) -> bool:
+    """判断填充对象是否应位于文字下方。"""
+    vector = block.vector
+    if vector is None or getattr(vector, "fill_color", None) is None:
+        return False
+    has_text_overlap = False
+    for text_block in page.blocks:
+        if text_block.kind not in _FIDELITY_TEXT_KINDS or not text_block.text.strip():
+            continue
+        if _bbox_overlap_area(block.bbox, text_block.bbox) <= 0:
+            continue
+        has_text_overlap = True
+        # 表单字段底色通常以无描边闭合矩形单独绘制。它的源对象顺序有时
+        # 晚于文字，继续按 z-order 会让 Word 的浮动形状盖住字段标签。
+        if _is_fill_only_rect(block):
+            return True
+        if text_block.z_order >= block.z_order:
+            return True
+    return block.layer == "background" and has_text_overlap
 
 
 def _place_header_footer_item(
@@ -1541,21 +1949,19 @@ def export_fidelity_docx(
                 if header_footer_native
                 else list(page.blocks)
             )
-            min_text_z = min(
-                (
-                    block.z_order
-                    for block in blocks
-                    if block.kind in _FIDELITY_TEXT_KINDS
-                ),
-                default=None,
-            )
-            blocks.sort(
-                key=lambda item: (
-                    item.z_order,
-                    item.reading_order if item.reading_order >= 0 else 10**9,
-                    item.kind,
+            def block_write_order(item: IRBlock) -> tuple[int, int, int, str]:
+                """让正文文字按阅读顺序进入 DOCX，同时保留图层排序。"""
+                reading_order = (
+                    item.reading_order
+                    if item.reading_order >= 0
+                    else 10**9
                 )
-            )
+                if item.is_text or item.is_table:
+                    # 相同阅读序号表示版面阶段无法再细分，保持 IR 原始稳定顺序。
+                    return (0, reading_order, 0, "")
+                return (1, item.z_order, reading_order, item.kind)
+
+            blocks.sort(key=block_write_order)
             for block in blocks:
                 if id(block) in white_backgrounds:
                     # Word 页面本身就是白色，重复画白底会盖住页眉/页脚
@@ -1568,11 +1974,10 @@ def export_fidelity_docx(
                     continue
                 behind_text = False
                 if block.kind in {"image", "vector"}:
-                    behind_text = block.layer == "background" or (
-                        block.layer == "body"
-                        and min_text_z is not None
-                        and block.z_order < min_text_z
-                    )
+                    if block.kind == "vector":
+                        behind_text = _filled_vector_is_behind_text(block, page)
+                    else:
+                        behind_text = block.layer == "background"
                 _place_fidelity_block(
                     context,
                     canvas,

@@ -78,9 +78,19 @@ def _running_text_key(value: str) -> str:
     return normalized[:80]
 
 
+def _has_running_text_signal(value: str) -> bool:
+    """过滤只有点线等版面装饰的内容，避免把正文引导点当作页脚。"""
+    return bool(re.search(r"[\w\u3400-\u9fff]", value, flags=re.UNICODE))
+
+
 def _is_running_candidate(line: PdfTextLine, page_height: float) -> bool:
     """只在页面顶部或底部识别页眉页脚和页码，避免误伤表格中的数字。"""
     return line.top <= page_height * 0.12 or line.bottom >= page_height * 0.88
+
+
+def _running_zone(line: PdfTextLine, page_height: float) -> str:
+    """返回运行内容位于页顶还是页底，避免跨区域文本互相支撑。"""
+    return "top" if line.top <= page_height * 0.12 else "bottom"
 
 
 def _mark_running_headers(
@@ -89,17 +99,18 @@ def _mark_running_headers(
     """识别跨页重复出现的页眉、页脚和页码，并标记为运行内容。"""
     if not pages:
         return pages
-    counts: Counter[str] = Counter()
-    entries: list[tuple[int, int, str]] = []
+    page_support: dict[tuple[str, str], set[int]] = {}
+    entries: list[tuple[int, int, tuple[str, str]]] = []
     for page_index, page in enumerate(pages):
         for line_index, line in enumerate(page.lines):
             if not _is_running_candidate(line, page.height):
                 continue
             key = _running_text_key(line.text)
-            if not key:
+            if not key or not _has_running_text_signal(line.text):
                 continue
-            counts[key] += 1
-            entries.append((page_index, line_index, key))
+            support_key = (key, _running_zone(line, page.height))
+            page_support.setdefault(support_key, set()).add(page_index)
+            entries.append((page_index, line_index, support_key))
     if not entries:
         return pages
     if len(pages) == 1:
@@ -113,7 +124,7 @@ def _mark_running_headers(
         marked = {
             (page_index, line_index)
             for page_index, line_index, key in entries
-            if counts[key] >= threshold
+            if len(page_support[key]) >= threshold
         }
     if not marked:
         return pages
@@ -684,16 +695,22 @@ def _build_text_blocks(
             tuple(sorted(group, key=lambda line: (line.top, line.x0)))
         )
         block = _text_block_from_lines(list(normalized), column)
+        region_ids = [line.region_id for line in normalized if line.region_id]
+        region_id = (
+            Counter(region_ids).most_common(1)[0][0]
+            if region_ids
+            else _region_for_bbox(
+                block.bbox,
+                boundaries=boundaries,
+                page_width=page_width,
+                config=config,
+            )
+        )
         blocks.append(
             replace(
                 block,
                 block_id=f"text-{index}",
-                region_id=_region_for_bbox(
-                    block.bbox,
-                    boundaries=boundaries,
-                    page_width=page_width,
-                    config=config,
-                ),
+                region_id=region_id,
             )
         )
     return tuple(blocks)

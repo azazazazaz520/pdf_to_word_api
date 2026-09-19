@@ -132,6 +132,7 @@ def _extract_page_images(
     max_pixels: int,
     png_optimize: bool,
     jpeg_quality: int,
+    include_raster_lines: bool = False,
 ) -> tuple[PdfImageBlock, ...]:
     """从 pdfium 页面对象中提取内嵌图片和页面坐标。"""
     images: list[PdfImageBlock] = []
@@ -149,7 +150,20 @@ def _extract_page_images(
             )
             width = max(x1 - x0, 0.0)
             height = max(y1 - y0, 0.0)
-            if width < 6.0 or height < 6.0:
+            try:
+                pixel_width, pixel_height = (
+                    int(value) for value in image_object.get_px_size()
+                )
+            except Exception:
+                pixel_width, pixel_height = 0, 0
+            raster_line = include_raster_lines and _is_raster_line_image(
+                image_object,
+                width=width,
+                height=height,
+                pixel_width=pixel_width,
+                pixel_height=pixel_height,
+            )
+            if (width < 6.0 or height < 6.0) and not raster_line:
                 continue
             encoded = _image_bytes_from_object(
                 image_object,
@@ -168,6 +182,7 @@ def _extract_page_images(
                     height=height,
                     data=data,
                     mime_type=mime_type,
+                    source="raster-line" if raster_line else "embedded",
                     z_order=object_index,
                 )
             )
@@ -176,6 +191,40 @@ def _extract_page_images(
             if close_object is not None:
                 close_object()
     return tuple(images)
+
+
+def _is_raster_line_image(
+    image_object: Any,
+    *,
+    width: float,
+    height: float,
+    pixel_width: int,
+    pixel_height: int,
+) -> bool:
+    """识别被拉伸成细条的单像素图片，排除透明或普通图片。"""
+    if (pixel_width, pixel_height) != (1, 1):
+        return False
+    horizontal = width >= 20.0 and height <= 2.0
+    vertical = height >= 10.0 and width <= 2.0
+    if not (horizontal or vertical):
+        return False
+    try:
+        bitmap = image_object.get_bitmap()
+        image = bitmap.to_pil()
+        if "A" in image.getbands():
+            alpha = image.getchannel("A").getextrema()[1]
+            if alpha <= 0:
+                return False
+    except Exception:
+        return False
+    finally:
+        close_bitmap = locals().get("bitmap")
+        if close_bitmap is not None and getattr(close_bitmap, "close", None):
+            close_bitmap.close()
+        close_image = locals().get("image")
+        if close_image is not None and getattr(close_image, "close", None):
+            close_image.close()
+    return True
 
 
 DEFAULT_EMBEDDED_IMAGE_MAX_PIXELS = 6_000_000

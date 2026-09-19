@@ -247,6 +247,195 @@ def _cell_spans_from_glyphs(
     return tuple(spans)
 
 
+def _glyph_row_groups(
+    glyphs: tuple[PdfTextGlyph, ...],
+    *,
+    tolerance: float = 1.5,
+) -> list[list[PdfTextGlyph]]:
+    """按字形的垂直基线分组，空格归入最近的可见文字行。"""
+    visible = [glyph for glyph in glyphs if glyph.bbox[3] > glyph.bbox[1]]
+    if not visible:
+        return []
+    groups: list[list[PdfTextGlyph]] = []
+    centers: list[float] = []
+    for glyph in sorted(visible, key=lambda item: (item.bbox[1], item.bbox[0])):
+        baseline = glyph.bbox[3]
+        if centers and abs(baseline - centers[-1]) <= tolerance:
+            groups[-1].append(glyph)
+            centers[-1] = sum(
+                item.bbox[3] for item in groups[-1]
+            ) / len(groups[-1])
+        else:
+            groups.append([glyph])
+            centers.append(baseline)
+    result: list[list[PdfTextGlyph]] = []
+    for glyph in glyphs:
+        if glyph in visible:
+            continue
+        center = glyph.bbox[3]
+        nearest = min(
+            range(len(centers)),
+            key=lambda index: abs(center - centers[index]),
+        )
+        groups[nearest].append(glyph)
+    for group in groups:
+        group.sort(key=lambda item: item.char_index if item.char_index >= 0 else 10**9)
+    return groups
+
+
+def _split_cell_by_glyph_rows(
+    cell: PdfTableCell,
+) -> list[tuple[list[PdfTextGlyph], tuple[float, float]]]:
+    groups = _glyph_row_groups(cell.glyphs)
+    if len(groups) < 2:
+        return []
+    return [
+        (
+            group,
+            (
+                min(glyph.bbox[1] for glyph in group),
+                max(glyph.bbox[3] for glyph in group),
+            ),
+        )
+        for group in groups
+    ]
+
+
+def _expand_uniform_internal_rows(table: PdfTable) -> PdfTable:
+    """把所有单元格共有的内部文字基线展开为逻辑行。"""
+    if not table.cells or table.row_count < 2:
+        return table
+    physical_rows: list[list[PdfTableCell]] = []
+    for row_index in range(table.row_count):
+        physical_rows.append(
+            [cell for cell in table.cells if cell.row_index == row_index]
+        )
+    expansion: dict[int, list[list[tuple[list[PdfTextGlyph], tuple[float, float]]]]] = {}
+    for row_index, cells in enumerate(physical_rows):
+        if not cells or any(cell.row_span != 1 for cell in cells):
+            continue
+        split_cells = [_split_cell_by_glyph_rows(cell) for cell in cells]
+        counts = Counter(len(groups) for groups in split_cells if groups)
+        if not counts:
+            continue
+        group_count, support = counts.most_common(1)[0]
+        if group_count < 2 or support < max(3, len(cells) // 2):
+            continue
+        if any(groups and len(groups) != group_count for groups in split_cells):
+            continue
+        expansion[row_index] = [
+            groups if groups else [([], (0.0, 0.0))] * group_count
+            for groups in split_cells
+        ]
+    if not expansion:
+        return table
+
+    new_boundaries: list[float] = [table.row_boundaries[0]]
+    visible_boundaries: list[bool] = [True]
+    row_offsets: dict[int, int] = {}
+    logical_row_count = 0
+    for row_index in range(table.row_count):
+        row_offsets[row_index] = logical_row_count
+        groups_for_row = expansion.get(row_index)
+        if not groups_for_row:
+            new_boundaries.append(table.row_boundaries[row_index + 1])
+            visible_boundaries.append(True)
+            logical_row_count += 1
+            continue
+        group_count = len(groups_for_row[0])
+        row_top = table.row_boundaries[row_index]
+        row_bottom = table.row_boundaries[row_index + 1]
+        group_bounds = [
+            (
+                max(
+                    (groups_for_row[cell_index][group_index][1][0]
+                     for cell_index in range(len(groups_for_row))
+                     if groups_for_row[cell_index][group_index][1] != (0.0, 0.0)),
+                    default=row_top,
+                ),
+                min(
+                    (groups_for_row[cell_index][group_index][1][1]
+                     for cell_index in range(len(groups_for_row))
+                     if groups_for_row[cell_index][group_index][1] != (0.0, 0.0)),
+                    default=row_bottom,
+                ),
+            )
+            for group_index in range(group_count)
+        ]
+        for group_index in range(group_count - 1):
+            boundary = (group_bounds[group_index][1] + group_bounds[group_index + 1][0]) / 2.0
+            new_boundaries.append(max(row_top, min(row_bottom, boundary)))
+            visible_boundaries.append(False)
+        new_boundaries.append(row_bottom)
+        visible_boundaries.append(True)
+        logical_row_count += group_count
+
+    new_cells: list[PdfTableCell] = []
+    new_rows = [
+        ["" for _ in range(table.column_count)]
+        for _ in range(logical_row_count)
+    ]
+    for row_index, cells in enumerate(physical_rows):
+        groups_for_row = expansion.get(row_index)
+        offset = row_offsets[row_index]
+        if not groups_for_row:
+            for cell in cells:
+                new_cells.append(cell if cell.row_index == offset else replace(cell, row_index=offset))
+                if cell.column_index < table.column_count:
+                    new_rows[offset][cell.column_index] = cell.text
+            continue
+        group_count = len(groups_for_row[0])
+        for cell_index, cell in enumerate(cells):
+            for group_index in range(group_count):
+                glyphs = groups_for_row[cell_index][group_index][0]
+                text = "".join(glyph.text for glyph in glyphs).strip()
+                if glyphs:
+                    text_bbox = (
+                        min(glyph.bbox[0] for glyph in glyphs),
+                        min(glyph.bbox[1] for glyph in glyphs),
+                        max(glyph.bbox[2] for glyph in glyphs),
+                        max(glyph.bbox[3] for glyph in glyphs),
+                    )
+                    font_sizes = [glyph.font_size for glyph in glyphs if glyph.font_size > 0]
+                    spans = _cell_spans_from_glyphs(glyphs)
+                    source_char_ids = tuple(
+                        dict.fromkeys(glyph.source_char_id for glyph in glyphs if glyph.source_char_id)
+                    )
+                else:
+                    text_bbox = (0.0, 0.0, 0.0, 0.0)
+                    font_sizes = []
+                    spans = ()
+                    source_char_ids = ()
+                logical_index = offset + group_index
+                new_cells.append(
+                    replace(
+                        cell,
+                        row_index=logical_index,
+                        bbox=(
+                            cell.bbox[0],
+                            new_boundaries[logical_index],
+                            cell.bbox[2],
+                            new_boundaries[logical_index + 1],
+                        ),
+                        text=text,
+                        text_bbox=text_bbox,
+                        font_size=(font_sizes[len(font_sizes) // 2] if font_sizes else 0.0),
+                        spans=spans,
+                        glyphs=tuple(glyphs),
+                        source_char_ids=source_char_ids,
+                    )
+                )
+                if cell.column_index < table.column_count:
+                    new_rows[logical_index][cell.column_index] = text
+    return replace(
+        table,
+        row_boundaries=tuple(new_boundaries),
+        rows=tuple(tuple(row) for row in new_rows),
+        cells=tuple(new_cells),
+        visible_row_boundaries=tuple(visible_boundaries),
+    )
+
+
 def _make_cell_span(glyphs: list[PdfTextGlyph]) -> PdfTextSpan:
     representative = glyphs[0]
     return PdfTextSpan(
@@ -450,7 +639,7 @@ def _extract_table(
             )
         )
 
-    return PdfTable(
+    return _expand_uniform_internal_rows(PdfTable(
         bbox=candidate.bbox,
         column_boundaries=column_boundaries,
         row_boundaries=row_boundaries,
@@ -463,15 +652,20 @@ def _extract_table(
                 for char_id in cell.source_char_ids
             )
         ),
-    )
+    ))
 
 
 def _find_tables(
     page: Any,
     lines: list[PdfTextLine],
     page_height: float,
+    raster_images: tuple[Any, ...] = (),
 ) -> tuple[PdfTable, ...]:
-    horizontal, vertical = _extract_vector_lines(page, page_height)
+    horizontal, vertical = _extract_vector_lines(
+        page,
+        page_height,
+        raster_images=raster_images,
+    )
     candidates = _horizontal_run_tables(horizontal, vertical)
     tables = [
         _extract_table(lines, candidate)
@@ -663,8 +857,16 @@ def _find_borderless_tables(
     page_width: float,
     page_height: float,
     existing_tables: tuple[PdfTable, ...],
+    confirmed_regions: tuple[Any, ...] = (),
 ) -> tuple[PdfTable, ...]:
     """通过重复列锚点和多行结构一致性识别无边框表格。"""
+    table_regions = tuple(
+        region
+        for region in confirmed_regions
+        if str(getattr(region, "kind", "")).lower() in {"table", "table_region"}
+    )
+    if confirmed_regions and not table_regions:
+        return ()
     candidates = [
         line
         for line in lines
@@ -672,6 +874,13 @@ def _find_borderless_tables(
         and not _line_in_tables(line, existing_tables)
         and line.x1 - line.x0 < page_width * 0.9
         and not _looks_like_code_table_line(line.text)
+        and (
+            not table_regions
+            or any(
+                _line_is_in_table(line, region.bbox)
+                for region in table_regions
+            )
+        )
     ]
     rows = _group_text_rows(candidates)
     anchor_rows = [row for row in rows if len(row) >= 2]

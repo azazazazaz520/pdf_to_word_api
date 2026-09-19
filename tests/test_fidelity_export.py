@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 import unittest
 import zipfile
+from itertools import count
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
+from docx import Document
 from docx.oxml import parse_xml
 from docx.oxml.ns import qn
 from PIL import Image
@@ -14,8 +17,17 @@ from reportlab.pdfgen.canvas import Canvas
 
 from src.validate.report import validate_docx_rendering
 from src.ir.builder import build_document_ir
+from src.ir.model import IRBlock, IRPage
 from src.layout.layout import extract_pdf_layout
-from src.export.fidelity import export_fidelity_docx
+from src.export.fidelity import (
+    _CanvasContext,
+    _FidelityContext,
+    _is_irregular_form_table,
+    _place_editable_form_table,
+    export_fidelity_docx,
+)
+from src.export.table_render import _set_pdf_cell_content, _table_rows_needing_reflow
+from src.layout.models import PdfTable, PdfTableCell
 
 
 _WORD_AVAILABLE: bool | None = None
@@ -363,7 +375,219 @@ class FidelityExportTest(unittest.TestCase):
             xml = _document_xml(output)
             self.assertIn("<w:tblpPr", xml)
             self.assertIn('w:tblLayout w:type="fixed"', xml)
+            self.assertIn('w:hRule="exact"', xml)
             self.assertEqual(len(_sections(output)), 1)
+
+    def test_table_font_shrink_compares_pdf_points_with_cell_points(self) -> None:
+        document = Document()
+        table = document.add_table(rows=1, cols=2)
+
+        def write_cell(cell, right_edge: float) -> float:
+            glyphs = tuple(
+                SimpleNamespace(
+                    text=character,
+                    bbox=(index * right_edge / 6.0, 0.0, (index + 1) * right_edge / 6.0, 10.0),
+                )
+                for index, character in enumerate("Longer")
+            )
+            span = SimpleNamespace(
+                glyphs=glyphs,
+                font_name="Arial",
+                font_size=10.0,
+                bold=False,
+                italic=False,
+                color=None,
+            )
+            _set_pdf_cell_content(
+                cell,
+                "Longer",
+                width=2.0,
+                is_header=False,
+                spans=(span,),
+                shrink_cell_font=True,
+            )
+            run = next(run for run in cell.paragraphs[0].runs if run.text == "Longer")
+            return run.font.size.pt
+
+        self.assertAlmostEqual(write_cell(table.cell(0, 0), 90.0), 10.0)
+        self.assertAlmostEqual(write_cell(table.cell(0, 1), 130.0), 9.0)
+
+    def test_table_reflow_keeps_narrow_replacement_font_text_visible(self) -> None:
+        table = PdfTable(
+            bbox=(0.0, 0.0, 252.0, 21.0),
+            column_boundaries=(0.0, 58.0, 252.0),
+            row_boundaries=(0.0, 21.0),
+            rows=(("Permanently and totally disabled", "Table structure"),),
+            cells=(
+                PdfTableCell(
+                    row_index=0,
+                    column_index=0,
+                    row_span=1,
+                    column_span=1,
+                    bbox=(0.0, 0.0, 58.0, 21.0),
+                    text="Permanently and totally disabled",
+                    font_size=7.0,
+                ),
+                PdfTableCell(
+                    row_index=0,
+                    column_index=1,
+                    row_span=1,
+                    column_span=1,
+                    bbox=(58.0, 0.0, 252.0, 21.0),
+                    text="Table structure",
+                    font_size=7.0,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            _table_rows_needing_reflow(
+                table,
+                row_offset=0,
+                cell_padding_points=(2.0, 0.0),
+            ),
+            {0},
+        )
+
+    def test_only_irregular_merged_form_tables_are_selected_for_local_fallback(self) -> None:
+        regular = PdfTable(
+            bbox=(0.0, 0.0, 180.0, 24.0),
+            column_boundaries=(0.0, 60.0, 120.0, 180.0),
+            row_boundaries=(0.0, 12.0, 24.0),
+            rows=(("A", "B", "C"), ("1", "2", "3")),
+            cells=tuple(
+                PdfTableCell(
+                    row_index=row,
+                    column_index=column,
+                    row_span=1,
+                    column_span=1,
+                    bbox=(column * 60.0, row * 12.0, (column + 1) * 60.0, (row + 1) * 12.0),
+                    text=value,
+                    font_size=8.0,
+                )
+                for row, values in enumerate((("A", "B", "C"), ("1", "2", "3")))
+                for column, value in enumerate(values)
+            ),
+        )
+        irregular = PdfTable(
+            bbox=(0.0, 0.0, 180.0, 60.0),
+            column_boundaries=(0.0, 60.0, 120.0, 180.0),
+            row_boundaries=(0.0, 30.0, 60.0),
+            rows=(("Long form field text", "", ""), ("", "", "")),
+            cells=(
+                PdfTableCell(
+                    row_index=0,
+                    column_index=0,
+                    row_span=2,
+                    column_span=2,
+                    bbox=(0.0, 0.0, 120.0, 60.0),
+                    text="Long form field text that needs a local form treatment and an additional label",
+                    font_size=8.0,
+                ),
+            ),
+        )
+        dotted_form = PdfTable(
+            bbox=(0.0, 0.0, 180.0, 120.0),
+            column_boundaries=(0.0, 60.0, 120.0, 180.0),
+            row_boundaries=tuple(float(index * 10) for index in range(13)),
+            rows=tuple(
+                (". . .", "", str(index))
+                for index in range(12)
+            ),
+            cells=tuple(
+                PdfTableCell(
+                    row_index=index,
+                    column_index=0,
+                    row_span=1,
+                    column_span=1,
+                    bbox=(0.0, index * 10.0, 60.0, (index + 1) * 10.0),
+                    text=". . .",
+                    font_size=8.0,
+                )
+                for index in range(6)
+            ),
+        )
+
+        self.assertFalse(_is_irregular_form_table(regular))
+        self.assertTrue(_is_irregular_form_table(irregular))
+        self.assertTrue(_is_irregular_form_table(dotted_form))
+
+        short_form = PdfTable(
+            bbox=(0.0, 0.0, 240.0, 24.0),
+            column_boundaries=tuple(float(index * 30) for index in range(9)),
+            row_boundaries=(0.0, 12.0, 24.0),
+            rows=(("Long form label with enough descriptive field text", "", "", "", "", "", ""), ("", "", "", "", "", "", "", "")),
+            cells=tuple(
+                PdfTableCell(
+                    row_index=0,
+                    column_index=index,
+                    row_span=1,
+                    column_span=1,
+                    bbox=(index * 30.0, 0.0, (index + 1) * 30.0, 12.0),
+                    text="Long form label with enough descriptive field text" if index == 0 else "",
+                    font_size=8.0,
+                )
+                for index in range(10)
+            ),
+        )
+        self.assertTrue(_is_irregular_form_table(short_form))
+
+    def test_irregular_form_table_rebuild_keeps_text_editable(self) -> None:
+        document = Document()
+        paragraph = document.add_paragraph()
+        context = _FidelityContext(
+            document=document,
+            source_pdf=None,
+            mode="fidelity",
+            min_confidence=0.0,
+            fallback_dpi=200.0,
+            fallback_max_pixels=100000,
+            page_width_points=200.0,
+            object_ids=count(1),
+        )
+        span = SimpleNamespace(
+            text="Editable field",
+            bbox=(12.0, 14.0, 72.0, 22.0),
+            glyphs=(),
+            font_name="Arial",
+            pdf_font_name="Helvetica",
+            font_size=8.0,
+            color=(0, 0, 0),
+            bold=False,
+            italic=False,
+        )
+        cell = SimpleNamespace(bbox=(10.0, 10.0, 90.0, 30.0), spans=(span,))
+        table = SimpleNamespace(
+            cells=(cell,),
+            has_borders=True,
+            border_color=(0, 0, 0),
+            border_width=0.0,
+        )
+        page = IRPage(page_number=1, width=200.0, height=300.0, route="text")
+        block = IRBlock(
+            kind="table",
+            page=1,
+            bbox=(10.0, 10.0, 90.0, 30.0),
+            table=table,
+            z_order=2,
+        )
+        report = {"placements": []}
+
+        rebuilt = _place_editable_form_table(
+            context,
+            _CanvasContext(document=document, paragraph=paragraph),
+            page,
+            block,
+            report=report,
+        )
+
+        self.assertTrue(rebuilt)
+        self.assertEqual(report["editable_form_table_count"], 1)
+        self.assertEqual(report["editable_form_text_count"], 1)
+        self.assertEqual(report["placements"][0]["reason"], "positioned_form_table")
+        xml = document.element.xml
+        self.assertIn("Editable field", xml)
+        self.assertIn("form_table_edge_1_", xml)
 
     def test_mixed_font_line_exports_separate_font_frames(self) -> None:
         with TemporaryDirectory() as temporary_directory:

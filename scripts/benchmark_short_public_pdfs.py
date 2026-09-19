@@ -9,6 +9,7 @@ import platform
 import subprocess
 import sys
 import time
+import tracemalloc
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,7 @@ def _payload(
     mode: str,
     output_dir: Path,
     render_word: bool,
+    layout_model_enabled: bool,
 ) -> dict[str, Any]:
     input_path = Path(sample["input"])
     return {
@@ -116,6 +118,8 @@ def _payload(
         "embedded_image_png_optimize": False,
         "task_timeout_seconds": 1800.0,
         "ocr_time_budget_seconds": 300.0,
+        "layout_model_enabled": layout_model_enabled,
+        "layout_model_min_chars": 500,
         "render_validation": render_word,
         "render_ssim": True,
         "render_text_compare": True,
@@ -136,21 +140,31 @@ def _run_one(
     sample_id: str,
     mode: str,
     render_word: bool,
+    layout_model_enabled: bool,
 ) -> dict[str, Any]:
     sample = _metadata(source_root, sample_id)
     output_dir = output_root / sample_id / mode
     output_dir.mkdir(parents=True, exist_ok=False)
+    payload = _payload(
+        sample=sample,
+        mode=mode,
+        output_dir=output_dir,
+        render_word=render_word,
+        layout_model_enabled=layout_model_enabled,
+    )
+    (output_dir / "payload.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     started = datetime.now(timezone.utc).isoformat()
     source_hash_start = _source_fingerprint(root)
     start_time = time.perf_counter()
-    result = process_job(
-        _payload(
-            sample=sample,
-            mode=mode,
-            output_dir=output_dir,
-            render_word=render_word,
-        )
-    )
+    tracemalloc.start()
+    try:
+        result = process_job(payload)
+        _, peak_memory = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
     elapsed = round(time.perf_counter() - start_time, 3)
     source_hash_end = _source_fingerprint(root)
     result_record = {
@@ -164,10 +178,57 @@ def _run_one(
         "source_hash_end": source_hash_end,
         "source_consistent": source_hash_start == source_hash_end,
         "render_word_requested": render_word,
+        "layout_model_enabled": layout_model_enabled,
+        "peak_python_memory_bytes": peak_memory,
         "result": result,
     }
     (output_dir / "result.json").write_text(
         json.dumps(result_record, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    quality = result.get("quality") if isinstance(result, dict) else None
+    output_path = Path(str(payload["output_path"]))
+    diagnostics = {
+        "sample": sample,
+        "input_sha256": sample["sha256"],
+        "source": {
+            "page_count": sample["source_page_count"],
+            "metadata": sample["metadata"],
+        },
+        "layout": {
+            "route": result.get("route") if isinstance(result, dict) else None,
+            "route_reason": result.get("route_reason") if isinstance(result, dict) else None,
+            "route_summary": (quality or {}).get("route_summary"),
+            "page_results": (quality or {}).get("page_results", []),
+            "warnings": (quality or {}).get("warnings", []),
+            "needs_review_pages": (quality or {}).get("needs_review_pages", []),
+        },
+        "ir": {
+            "source_page_count": (quality or {}).get("source_page_count"),
+            "effective_source_page_count": (quality or {}).get("effective_source_page_count"),
+            "final_content": (quality or {}).get("final_content"),
+            "fonts": (quality or {}).get("fonts"),
+        },
+        "export": {
+            "mode": mode,
+            "structured": (quality or {}).get("structured"),
+            "fidelity": (quality or {}).get("fidelity"),
+            "quality_gate": (quality or {}).get("quality_gate"),
+            "render_validation": (quality or {}).get("render_validation"),
+        },
+        "output": {
+            "path": str(output_path),
+            "exists": output_path.is_file(),
+            "bytes": output_path.stat().st_size if output_path.is_file() else 0,
+            "sha256": _sha256(output_path) if output_path.is_file() else None,
+        },
+        "timing": {
+            "elapsed_sec": elapsed,
+            "peak_python_memory_bytes": peak_memory,
+        },
+    }
+    (output_dir / "diagnostics.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return result_record
@@ -180,6 +241,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("structured", "fidelity", "both"), default="both")
     parser.add_argument("--samples", nargs="+", choices=tuple(SAMPLE_FILES), required=True)
     parser.add_argument("--render-word", action="store_true")
+    parser.add_argument(
+        "--disable-layout-model",
+        action="store_true",
+        help="关闭版面模型，仅用于独立几何与导出基线复测。",
+    )
     return parser
 
 
@@ -207,6 +273,7 @@ def main() -> int:
                     sample_id=sample_id,
                     mode=mode,
                     render_word=args.render_word,
+                    layout_model_enabled=not args.disable_layout_model,
                 )
             )
     run_record = {
@@ -219,13 +286,36 @@ def main() -> int:
         "mode": args.mode,
         "samples": args.samples,
         "render_word": args.render_word,
+        "layout_model_enabled": not args.disable_layout_model,
         "results": results,
     }
     (output_root / "run.json").write_text(
         json.dumps(run_record, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(json.dumps(run_record, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "output_root": str(output_root),
+                "results": [
+                    {
+                        "sample": item["sample"],
+                        "mode": item["mode"],
+                        "status": (item.get("result") or {}).get("status"),
+                        "elapsed_sec": item["elapsed_sec"],
+                        "quality_gate": (
+                            ((item.get("result") or {}).get("quality") or {})
+                            .get("quality_gate", {})
+                            .get("status")
+                        ),
+                    }
+                    for item in results
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 

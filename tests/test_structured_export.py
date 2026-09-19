@@ -5,11 +5,18 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 from docx import Document
 from PIL import Image
 
-from src.export.structured import _complex_table_regions, export_structured_docx
+from src.export.structured import (
+    _complex_table_regions,
+    _dense_form_background_blocks,
+    _positioned_table_cell_metrics,
+    _positioned_table_cell_lines,
+    export_structured_docx,
+)
 from src.ir.model import IRBlock, IRDocument, IRPage, IRTextLine
 from src.layout.models import PdfTable, PdfTableCell
 
@@ -99,6 +106,74 @@ def _complex_pdf_table() -> PdfTable:
 
 
 class StructuredExportTest(unittest.TestCase):
+    def test_dense_form_background_selection_keeps_only_large_color_fills(self) -> None:
+        page = IRPage(
+            page_number=1,
+            width=600.0,
+            height=800.0,
+            route="text",
+            blocks=[
+                IRBlock(
+                    kind="vector",
+                    page=1,
+                    bbox=(40.0, 20.0, 560.0, 50.0),
+                    vector=SimpleNamespace(
+                        fill_color=(220, 255, 251),
+                        stroke_color=None,
+                    ),
+                ),
+                IRBlock(
+                    kind="vector",
+                    page=1,
+                    bbox=(480.0, 100.0, 500.0, 112.0),
+                    vector=SimpleNamespace(
+                        fill_color=(192, 192, 192),
+                        stroke_color=None,
+                    ),
+                ),
+                IRBlock(
+                    kind="vector",
+                    page=1,
+                    bbox=(40.0, 60.0, 560.0, 90.0),
+                    vector=SimpleNamespace(
+                        fill_color=(255, 255, 255),
+                        stroke_color=None,
+                    ),
+                ),
+            ],
+        )
+
+        backgrounds = _dense_form_background_blocks(page)
+
+        self.assertEqual(len(backgrounds), 1)
+        self.assertEqual(backgrounds[0].bbox, (40.0, 20.0, 560.0, 50.0))
+
+    def test_positioned_table_cell_keeps_space_glyph_on_text_line(self) -> None:
+        glyphs = (
+            SimpleNamespace(text="I", bbox=(0.0, 0.0, 1.0, 5.0), font_size=7.5),
+            SimpleNamespace(text="f", bbox=(1.2, 0.0, 2.2, 5.0), font_size=7.5),
+            SimpleNamespace(text=" ", bbox=(2.3, 4.8, 3.3, 4.81), font_size=7.5),
+            SimpleNamespace(text="m", bbox=(3.5, 1.0, 5.5, 5.0), font_size=7.5),
+            SimpleNamespace(text="o", bbox=(5.7, 1.0, 7.0, 5.0), font_size=7.5),
+            SimpleNamespace(text="r", bbox=(7.2, 1.0, 8.2, 5.0), font_size=7.5),
+            SimpleNamespace(text="e", bbox=(8.4, 1.0, 9.7, 5.0), font_size=7.5),
+        )
+        lines = _positioned_table_cell_lines(SimpleNamespace(glyphs=glyphs))
+
+        self.assertEqual([text for text, _, _ in lines], ["If more"])
+
+    def test_positioned_table_cell_box_leaves_word_text_room(self) -> None:
+        metrics = _positioned_table_cell_metrics(
+            SimpleNamespace(bbox=(10.0, 10.0, 60.0, 40.0), font_size=7.0),
+            "label",
+            (12.0, 15.0, 48.0, 20.0),
+            7.0,
+        )
+
+        self.assertGreaterEqual(metrics[2], 37.0)
+        self.assertGreaterEqual(metrics[3], 8.4)
+        self.assertLessEqual(metrics[0] + metrics[2], 60.0)
+
     def test_overfull_table_cells_are_marked_for_region_fallback(self) -> None:
         page = IRPage(
             page_number=1,

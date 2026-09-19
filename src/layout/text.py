@@ -484,6 +484,9 @@ def _normalize_aggregated_text(
     """在字符已按几何顺序聚合后归一化文本。"""
     if not value:
         return ""
+    # 少数内嵌字体把 en dash/em dash 读成替换字符组合；其语义可由固定
+    # 的 PDFium 编码模式确认，先还原再做逐字符归一化。
+    value = value.replace("\ufffdC", "–").replace("\ufffd\ufffd", "—")
     normalized = "".join(
         character
         if character in {" ", "\t"}
@@ -685,6 +688,24 @@ def _projection(
     return character.center_x * axis[0] + character.center_y * axis[1]
 
 
+def _line_normal_projection(
+    character: _TextCharacter,
+    normal: tuple[float, float],
+    rotation: float,
+) -> float:
+    """返回更接近文字基线的行法向坐标。
+
+    横排大字的字符外框可能向上延伸到相邻小字行。使用外框中心会让大字
+    把两行错误合并；横排文字的下边界更接近基线，旋转文字继续使用中心
+    投影以避免改变原有方向处理。
+    """
+    if _angle_distance(rotation, 0.0) <= 5.0:
+        return character.bottom
+    if _angle_distance(rotation, 180.0) <= 5.0:
+        return -character.top
+    return _projection(character, normal)
+
+
 def _projected_extent(
     character: _TextCharacter,
     axis: tuple[float, float],
@@ -778,7 +799,7 @@ def _geometry_character_groups(
         normal = (-direction[1], direction[0])
         entries = sorted(
             (
-                _projection(character, normal),
+                _line_normal_projection(character, normal, orientation),
                 character.char_index if character.char_index >= 0 else 0,
                 character,
             )
@@ -815,10 +836,23 @@ def _geometry_character_groups(
             else:
                 rows[best_index].append(character)
                 row_centers[best_index] = sum(
-                    _projection(item, normal) for item in rows[best_index]
+                    _line_normal_projection(item, normal, orientation)
+                    for item in rows[best_index]
                 ) / len(rows[best_index])
-                row_sizes[best_index] = max(
-                    row_sizes[best_index], size
+                sizes = sorted(
+                    max(
+                        float(item.font_size or 0.0),
+                        abs(item.x1 - item.x0),
+                        abs(item.bottom - item.top),
+                        1.0,
+                    )
+                    for item in rows[best_index]
+                )
+                middle = len(sizes) // 2
+                row_sizes[best_index] = (
+                    sizes[middle]
+                    if len(sizes) % 2
+                    else (sizes[middle - 1] + sizes[middle]) / 2.0
                 )
         row_for_character = {
             id(character): row_index
@@ -876,7 +910,8 @@ def _geometry_character_groups(
                 target_row = min(
                     range(len(rows)),
                     key=lambda index: abs(
-                        _projection(character, normal) - row_centers[index]
+                        _line_normal_projection(character, normal, orientation)
+                        - row_centers[index]
                     ),
                 )
             if target_row is not None:
@@ -969,13 +1004,46 @@ def _ordered_characters(
         # 竖排或任意角度文字；多个对象组成的同行再使用几何投影排序。
         return sorted(characters, key=lambda item: item.char_index)
     direction = _direction_from_rotation(line_rotation)
-    return sorted(
+    ordered = sorted(
         characters,
         key=lambda item: (
             _projection(item, direction),
             item.char_index if item.char_index >= 0 else 0,
         ),
     )
+    if _angle_distance(line_rotation, 0.0) <= 5.0 or _angle_distance(
+        line_rotation, 180.0
+    ) <= 5.0:
+        # 空格常只有一个点的字框，PDFium 给出的 x 坐标可能落在前一个字
+        # 左侧几十分之一点。按几何坐标排序会把空格插入词内；空格自身的
+        # 字符索引仍可靠，因此只对这类空格恢复字符流中的相邻关系。
+        non_point_spaces = [
+            item
+            for item in ordered
+            if not (_is_point_like(item) and item.text.isspace())
+        ]
+        point_spaces = sorted(
+            (
+                item
+                for item in characters
+                if _is_point_like(item)
+                and item.text.isspace()
+                and item.char_index >= 0
+            ),
+            key=lambda item: item.char_index,
+        )
+        if point_spaces:
+            ordered = list(non_point_spaces)
+            for space in point_spaces:
+                previous = [
+                    index
+                    for index, item in enumerate(ordered)
+                    if item.char_index >= 0
+                    and item.char_index < space.char_index
+                ]
+                insert_at = previous[-1] + 1 if previous else 0
+                ordered.insert(insert_at, space)
+    return ordered
 
 
 def _glyph_from_character(character: _TextCharacter) -> PdfTextGlyph:

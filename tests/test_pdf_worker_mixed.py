@@ -320,7 +320,7 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
             )
         )
 
-    def test_structured_quality_gate_allows_expected_reflow(self) -> None:
+    def test_structured_quality_gate_allows_reflow_but_requires_visual_evidence(self) -> None:
         quality = {
             "export_mode": "structured",
             "render_validation": {
@@ -338,7 +338,11 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
             page_delta_warn_absolute=3,
         )
 
-        self.assertEqual(gate["status"], "passed")
+        self.assertEqual(gate["status"], "unverified")
+        self.assertIn(
+            "structured_visual_evidence",
+            {check["name"] for check in gate["checks"]},
+        )
         self.assertIn(
             "structured_reflow_allowed=True",
             next(
@@ -346,6 +350,42 @@ class PdfWorkerMixedRouteTest(unittest.TestCase):
                 for check in gate["checks"]
                 if check["name"] == "render_page_delta"
             ),
+        )
+
+    def test_structured_visual_difference_requires_review(self) -> None:
+        quality = {
+            "export_mode": "structured",
+            "structured_acceptance": {
+                "pages_below_threshold": [1, 2],
+                "text_coverage": {
+                    "status": "succeeded",
+                    "min_coverage": 0.99,
+                },
+            },
+            "render_validation": {
+                "status": "succeeded",
+                "source_page_count": 2,
+                "page_delta": 0,
+                "blank_pages": [],
+                "ssim": {"status": "succeeded", "min_ssim": 0.45},
+            },
+        }
+
+        gate = _evaluate_quality_gate(
+            quality,
+            enabled=True,
+            page_delta_warn_ratio=0.05,
+            page_delta_warn_absolute=3,
+        )
+
+        self.assertEqual(gate["status"], "unverified")
+        self.assertEqual(
+            next(
+                check["status"]
+                for check in gate["checks"]
+                if check["name"] == "structured_visual_evidence"
+            ),
+            "unverified",
         )
 
     def test_structured_render_validation_uses_reflow_acceptance(self) -> None:

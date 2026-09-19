@@ -66,6 +66,18 @@ def build_pipeline(engine: str) -> Any:
     )
 
 
+def build_layout_detection_pipeline() -> Any:
+    """构建只负责版面框检测的轻量模型。"""
+    from paddleocr import LayoutDetection
+
+    return LayoutDetection(
+        model_name="PP-DocLayout-S",
+        device="cpu",
+        enable_mkldnn=False,
+        cpu_threads=4,
+    )
+
+
 def get_page_count(path: Path) -> int | None:
     try:
         from pypdfium2 import PdfDocument

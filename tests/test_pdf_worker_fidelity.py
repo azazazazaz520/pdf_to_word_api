@@ -14,6 +14,29 @@ from reportlab.pdfgen.canvas import Canvas
 from src.pdf_worker import process_job
 
 
+class _FakeLayoutPipeline:
+    def __init__(self) -> None:
+        self.inputs: list[object] = []
+        self.options: dict[str, object] = {}
+
+    def predict_iter(self, input: object, **kwargs: object):
+        self.inputs.append(input)
+        self.options = kwargs
+        yield {
+            "layout_det_res": {
+                "boxes": [
+                    {
+                        "coordinate": [0.0, 0.0, 1200.0, 1700.0],
+                        "label": "text",
+                        "score": 0.99,
+                    }
+                ]
+            },
+            "width": 1200,
+            "height": 1700,
+        }
+
+
 def _base_payload(root: Path, pdf_path: Path, page_count: int) -> dict:
     return {
         "job_id": "fidelity-test",
@@ -79,6 +102,47 @@ def _write_mixed_pdf(path: Path, image_path: Path) -> None:
 
 
 class PdfWorkerFidelityTest(unittest.TestCase):
+    def test_layout_model_completion_requires_regions_and_reaches_layout(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "dense.pdf"
+            _write_dense_text_pdf(pdf_path)
+            payload = _base_payload(root, pdf_path, page_count=1)
+            payload["layout_model_min_chars"] = 1
+            payload["layout_model_enabled"] = True
+            fake_pipeline = _FakeLayoutPipeline()
+
+            with patch("src.pdf_worker._get_layout_pipeline", return_value=fake_pipeline):
+                result = process_job(payload)
+
+            self.assertEqual(result["status"], "succeeded")
+            events = [
+                json.loads(line)
+                for line in (root / "stages.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            completed = next(
+                event for event in events if event["stage"] == "layout_model_completed"
+            )
+            self.assertGreater(completed["region_page_count"], 0)
+            self.assertIsInstance(fake_pipeline.inputs[0], list)
+            self.assertEqual(
+                result["quality"]["source_audit"]["source"],
+                "pdf_text_layout",
+            )
+            self.assertEqual(result["quality"]["source_audit"]["status"], "stage_only")
+            self.assertTrue(
+                result["quality"]["source_audit"][
+                    "independent_raw_pdfium_character_list"
+                ]
+            )
+            self.assertGreater(result["quality"]["source_audit"]["source_character_count"], 0)
+            model_regions = [
+                region
+                for region in result["quality"]["page_results"][0]["regions"]
+                if region["source"] == "layout-model"
+            ]
+            self.assertGreater(len(model_regions), 0)
+
     def test_conversion_defaults_to_structured_flow(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

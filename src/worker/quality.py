@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
+import posixpath
+import re
 from typing import Any
 from pathlib import Path
 import zipfile
@@ -80,21 +83,48 @@ def evaluate_final_content_quality(
             )
         )
 
-    normalized_source = "".join(str(source_text).split())
-    normalized_output = "".join(str(output_text).split())
+    normalized_source = _canonical_content_text(source_text)
+    normalized_output = _canonical_content_text(output_text)
     if normalized_source and normalized_output:
-        text_status = (
-            "passed"
-            if normalized_source in normalized_output
-            else "failed"
-            if len(normalized_output) < len(normalized_source) * 0.99
-            else "unverified"
-        )
+        occurrences = _count_overlapping(normalized_output, normalized_source)
+        detail = "source_sequence_matched_once"
+        if occurrences == 0:
+            math_source = _compact_math_spacing(normalized_source)
+            math_occurrences = _count_overlapping(normalized_output, math_source)
+            if math_occurrences:
+                occurrences = math_occurrences
+                detail = "source_sequence_matched_once_with_math_spacing"
+        if occurrences == 0:
+            if _has_compacted_word_pair(normalized_source, normalized_output):
+                text_status = "failed"
+                detail = "source_word_space_lost"
+            elif _visible_character_sequence(normalized_source) == _visible_character_sequence(
+                normalized_output
+            ):
+                text_status = "passed"
+                detail = "source_sequence_matched_with_whitespace_variations"
+            elif _visible_character_counter(normalized_source) == _visible_character_counter(
+                normalized_output
+            ):
+                text_status = "unverified"
+                detail = "visible_characters_matched_but_sequence_unverified"
+            else:
+                text_status = "failed"
+                detail = "source_sequence_not_found"
+        elif occurrences > 1:
+            text_status = "failed"
+            detail = f"source_sequence_repeated={occurrences}"
+        else:
+            text_status = "passed"
+            detail = "source_sequence_matched_once"
         checks.append(
             _check_status(
                 "text_content_presence",
                 text_status,
-                f"source_length={len(normalized_source)}, output_length={len(normalized_output)}",
+                (
+                f"source_length={len(normalized_source)}, "
+                f"output_length={len(normalized_output)}, {detail}"
+                ),
             )
         )
     else:
@@ -120,20 +150,211 @@ def evaluate_final_content_quality(
     }
 
 
-def read_docx_text(path: Path) -> str:
-    """从最终 DOCX XML 回读可见文字，供内容门禁独立取证。"""
+def formula_text_exception_is_local(
+    *,
+    source_blocks: list[Any] | tuple[Any, ...],
+    placements: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    output_text: str,
+) -> bool:
+    """仅当公式有实际导出证据且普通文本顺序仍完整时允许局部未验证。"""
+    formula_blocks = [
+        block
+        for block in source_blocks
+        if getattr(block, "kind", "") == "formula"
+        and str(getattr(block, "text", "") or "").strip()
+    ]
+    if not formula_blocks:
+        return False
+    formula_ids = {
+        str(getattr(block, "block_id", ""))
+        for block in formula_blocks
+        if str(getattr(block, "block_id", ""))
+    }
+    evidenced_ids = {
+        str(placement.get("block_id"))
+        for placement in placements
+        if str(placement.get("block_id", "")) in formula_ids
+        and placement.get("status") in {"native", "image_fallback", "covered_by_image_fallback"}
+        and (
+            "formula" in str(placement.get("reason", ""))
+            or str(placement.get("reason", "")) == "flow_formula_omml"
+        )
+    }
+    if evidenced_ids != formula_ids:
+        return False
+    ordinary_source = _canonical_content_text(
+        " ".join(
+            str(getattr(block, "text", "") or "")
+            for block in source_blocks
+            if getattr(block, "kind", "") != "formula"
+        )
+    )
+    normalized_output = _canonical_content_text(output_text)
+    if not ordinary_source or not normalized_output:
+        return False
+    for block in formula_blocks:
+        formula_text = _canonical_content_text(
+            str(getattr(block, "text", "") or "")
+        )
+        compact_text = re.sub(r"\s+", "", formula_text)
+        for candidate in sorted({formula_text, compact_text}, key=len, reverse=True):
+            if candidate:
+                normalized_output = normalized_output.replace(candidate, " ")
+    normalized_output = _canonical_content_text(normalized_output)
+    return _count_overlapping(normalized_output, ordinary_source) == 1
+
+
+def _canonical_content_text(value: str) -> str:
+    """统一段落换行的表现，但保留可见词间空格。"""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _count_overlapping(value: str, needle: str) -> int:
+    if not value or not needle:
+        return 0
+    return sum(
+        value[index : index + len(needle)] == needle
+        for index in range(len(value) - len(needle) + 1)
+    )
+
+
+def _compact_math_spacing(value: str) -> str:
+    """兼容 OMML 回读时公式标签丢失的词间空格。"""
+    pattern = re.compile(
+        r"(?<![A-Za-z])([A-Za-z][A-Za-z ]{1,60})\s*=\s*"
+        r"([A-Za-z0-9.+\-/()]+)"
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        left = re.sub(r"\s+", "", match.group(1))
+        return f"{left}={match.group(2)}"
+
+    return pattern.sub(replace, value)
+
+
+def _visible_character_counter(value: str) -> Counter[str]:
+    return Counter(character for character in value if not character.isspace())
+
+
+def _visible_character_sequence(value: str) -> str:
+    """返回去除空白后的可见字符顺序，用于识别排版产生的空白差异。"""
+    return "".join(character for character in value if not character.isspace())
+
+
+def _has_compacted_word_pair(source: str, output: str) -> bool:
+    for match in re.finditer(
+        r"(?<![A-Za-z])([A-Za-z]{2,})\s+([A-Za-z]{2,})(?![A-Za-z])",
+        source,
+    ):
+        left, right = match.groups()
+        if f"{left}{right}" in output and f"{left} {right}" not in output:
+            return True
+    return False
+
+
+def read_docx_text(path: Path, *, include_headers_footers: bool = True) -> str:
+    """回读 DOCX 可见文字，可按质量门禁需要只读取正文。"""
     namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    texts: list[str] = []
-    with zipfile.ZipFile(path) as archive:
-        for name in archive.namelist():
-            if not name.startswith("word/") or not name.endswith(".xml"):
-                continue
-            root = ET.fromstring(archive.read(name))
-            texts.extend(
-                node.text or ""
-                for node in root.iter(f"{namespace}t")
+    math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+    markup_namespace = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+    rel_namespace = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    paragraph_tag = f"{namespace}p"
+    text_tags = {f"{namespace}t", f"{math_namespace}t"}
+    alternate_content_tag = f"{markup_namespace}AlternateContent"
+    choice_tag = f"{markup_namespace}Choice"
+    fallback_tag = f"{markup_namespace}Fallback"
+
+    def visit_active(element: ET.Element, paragraphs: list[ET.Element]) -> None:
+        if element.tag == alternate_content_tag:
+            choice = next(
+                (child for child in element if child.tag == choice_tag),
+                None,
             )
-    return "".join(texts)
+            if choice is None:
+                choice = next(
+                    (child for child in element if child.tag == fallback_tag),
+                    None,
+                )
+            if choice is not None:
+                for child in choice:
+                    visit_active(child, paragraphs)
+            return
+        if element.tag == fallback_tag:
+            return
+        if element.tag == paragraph_tag:
+            paragraphs.append(element)
+        for child in element:
+            visit_active(child, paragraphs)
+
+    def active_leaf_paragraphs(root: ET.Element) -> list[ET.Element]:
+        paragraphs: list[ET.Element] = []
+        visit_active(root, paragraphs)
+        active_paragraph_ids = {id(paragraph) for paragraph in paragraphs}
+        return [
+            paragraph
+            for paragraph in paragraphs
+            if not any(
+                id(child) in active_paragraph_ids
+                for child in paragraph.iter(paragraph_tag)
+                if child is not paragraph
+            )
+        ]
+
+    def story_text(root: ET.Element) -> str:
+        paragraphs: list[str] = []
+        for paragraph in active_leaf_paragraphs(root):
+            value_parts: list[str] = []
+
+            def append_active_text(element: ET.Element) -> None:
+                if element.tag == alternate_content_tag:
+                    choice = next(
+                        (child for child in element if child.tag == choice_tag),
+                        None,
+                    )
+                    if choice is None:
+                        choice = next(
+                            (child for child in element if child.tag == fallback_tag),
+                            None,
+                        )
+                    if choice is not None:
+                        for child in choice:
+                            append_active_text(child)
+                    return
+                if element.tag == fallback_tag:
+                    return
+                if element.tag in text_tags:
+                    value_parts.append(element.text or "")
+                    return
+                for child in element:
+                    append_active_text(child)
+
+            append_active_text(paragraph)
+            value = "".join(value_parts)
+            if value:
+                paragraphs.append(value)
+        return "\n".join(paragraphs)
+
+    with zipfile.ZipFile(path) as archive:
+        document_name = "word/document.xml"
+        document_root = ET.fromstring(archive.read(document_name))
+        stories = [story_text(document_root)]
+        rels_name = "word/_rels/document.xml.rels"
+        if include_headers_footers and rels_name in archive.namelist():
+            rels_root = ET.fromstring(archive.read(rels_name))
+            for relationship in rels_root.findall(f"{rel_namespace}Relationship"):
+                relationship_type = str(relationship.get("Type") or "")
+                if not (
+                    relationship_type.endswith("/header")
+                    or relationship_type.endswith("/footer")
+                ):
+                    continue
+                target = str(relationship.get("Target") or "")
+                target = target.lstrip("/")
+                target = posixpath.normpath(posixpath.join("word", target))
+                if target.startswith("../") or target not in archive.namelist():
+                    continue
+                stories.append(story_text(ET.fromstring(archive.read(target))))
+    return "\n".join(value for value in stories if value)
 
 
 
@@ -222,6 +443,44 @@ def _evaluate_quality_gate(
             "detail": f"blank_pages={blank_pages}",
         },
     ]
+    if structured_mode:
+        structured_acceptance = quality.get("structured_acceptance")
+        if not isinstance(structured_acceptance, dict):
+            checks.append(
+                {
+                    "name": "structured_visual_evidence",
+                    "status": "unverified",
+                    "detail": "结构化导出缺少视觉验收记录",
+                }
+            )
+        else:
+            ssim = render.get("ssim") or {}
+            text_coverage = structured_acceptance.get("text_coverage") or {}
+            if text_coverage.get("status") == "failed":
+                visual_status = "failed"
+            elif (
+                ssim.get("status") != "succeeded"
+                or text_coverage.get("status") != "succeeded"
+            ):
+                visual_status = "unverified"
+            elif structured_acceptance.get("pages_below_threshold"):
+                # 结构化路线允许重排，像素差异用于标记人工复核，不能直接
+                # 当作坐标保真失败；存在明确差异时仍不能报告为完全通过。
+                visual_status = "unverified"
+            else:
+                visual_status = "passed"
+            checks.append(
+                {
+                    "name": "structured_visual_evidence",
+                    "status": visual_status,
+                    "detail": (
+                        f"ssim_status={ssim.get('status')}, "
+                        f"pages_below_threshold="
+                        f"{structured_acceptance.get('pages_below_threshold', [])}, "
+                        f"text_coverage_status={text_coverage.get('status')}"
+                    ),
+                }
+            )
     fidelity_acceptance = quality.get("fidelity_acceptance")
     if isinstance(fidelity_acceptance, dict) and not structured_mode:
         for key, name in (
@@ -232,10 +491,17 @@ def _evaluate_quality_gate(
             ("font_size_ok", "fidelity_font_size"),
         ):
             value = fidelity_acceptance.get(key)
+            status = (
+                "passed"
+                if value is True
+                else "failed"
+                if value is False
+                else "unverified"
+            )
             checks.append(
                 {
                     "name": name,
-                    "status": "passed" if value is True else "failed",
+                    "status": status,
                     "detail": f"{key}={value!r}",
                 }
             )
@@ -299,23 +565,35 @@ def _apply_fidelity_acceptance(
         text_layout.get("status") == "succeeded" and matched_lines > 0
     )
     ssim_available = ssim.get("status") == "succeeded"
+    page_delta = render_result.get("page_delta")
+    unexpected_blank_pages = render_result.get("unexpected_blank_pages")
+    page_count_match = None if page_delta is None else page_delta == 0
+    no_unexpected_blank_pages = (
+        None
+        if unexpected_blank_pages is None
+        else not unexpected_blank_pages
+    )
+    if ssim_available and isinstance(ssim.get("min_ssim"), (int, float)):
+        ssim_ok = float(ssim["min_ssim"]) >= ssim_threshold
+    elif ssim.get("status") == "failed":
+        ssim_ok = False
+    else:
+        ssim_ok = None
+    if text_layout_available:
+        bbox_ok = bool(text_layout.get("passes_bbox", False))
+        font_size_ok = bool(text_layout.get("passes_font_size", False))
+    elif text_layout.get("status") == "failed":
+        bbox_ok = False
+        font_size_ok = False
+    else:
+        bbox_ok = None
+        font_size_ok = None
     checks = {
-        "page_count_match": render_result.get("page_delta") == 0,
-        "no_unexpected_blank_pages": not render_result.get(
-            "unexpected_blank_pages"
-        ),
-        "ssim_ok": (
-            (not ssim_available)
-            or (ssim.get("min_ssim") or 0.0) >= ssim_threshold
-        ),
-        "bbox_ok": (
-            not text_layout_available
-            or bool(text_layout.get("passes_bbox", False))
-        ),
-        "font_size_ok": (
-            not text_layout_available
-            or bool(text_layout.get("passes_font_size", False))
-        ),
+        "page_count_match": page_count_match,
+        "no_unexpected_blank_pages": no_unexpected_blank_pages,
+        "ssim_ok": ssim_ok,
+        "bbox_ok": bbox_ok,
+        "font_size_ok": font_size_ok,
     }
     quality["fidelity_acceptance"] = {
         **checks,

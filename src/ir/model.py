@@ -594,6 +594,9 @@ class IRDocument:
             for key in (
                 "native_block_count",
                 "image_fallback_count",
+                "editable_form_table_count",
+                "editable_form_table_background_count",
+                "editable_form_text_count",
                 "page_image_fallback",
                 "bbox_error_max",
                 "font_size_error_max",

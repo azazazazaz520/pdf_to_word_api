@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ from .layout.images import DEFAULT_EMBEDDED_IMAGE_JPEG_QUALITY, DEFAULT_EMBEDDED
 from .layout.layout import extract_pdf_layout
 from .pdf_routing import analyze_pdf_text
 from .service.ocr_quality import summarize_ocr_page
+from .worker.source_audit import audit_pdfium_source_characters
 from .export.document_setup import page_render_scale
 from .export.fidelity import (
     DEFAULT_FIDELITY_FALLBACK_DPI,
@@ -28,6 +30,132 @@ from .export.fidelity import (
 from .export.structured import STRUCTURED_MODES, export_structured_docx
 from .page_render import render_page_image
 from .run_validation import build_pipeline
+
+
+def _quality_source_block_text(block: IRBlock) -> str:
+    """按导出后的可见顺序生成质量门使用的块文本。"""
+    if block.kind in {"table", "html_table"}:
+        table = getattr(block, "table", None)
+        rows = tuple(getattr(table, "rows", ()) or ())
+        if rows:
+            return "\n".join(
+                "".join(str(value or "") for value in row)
+                for row in rows
+                if any(str(value or "").strip() for value in row)
+            )
+        return "\n".join(
+            str(cell.text or "")
+            for cell in getattr(table, "cells", ())
+            if str(cell.text or "").strip()
+        )
+    if block.kind == "bullet" and block.lines:
+        return "\n".join(
+            str(line.text or "")
+            for line in block.lines
+            if str(line.text or "").strip()
+        )
+    return block.text
+
+
+def _layout_detection_boxes(result: Any) -> tuple[list[dict[str, Any]], int | None, int | None]:
+    """从版面模型结果提取可序列化的区域框和输入像素尺寸。"""
+    if isinstance(result, dict):
+        detector = result.get("layout_det_res")
+        if detector is None and result.get("boxes") is not None:
+            detector = result
+        width = result.get("width")
+        height = result.get("height")
+    else:
+        detector = getattr(result, "layout_det_res", None)
+        if detector is None and getattr(result, "boxes", None) is not None:
+            detector = result
+        width = getattr(result, "width", None)
+        height = getattr(result, "height", None)
+    input_image = (
+        result.get("input_img")
+        if isinstance(result, dict)
+        else getattr(result, "input_img", None)
+    )
+    shape = getattr(input_image, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        height = height or int(shape[0])
+        width = width or int(shape[1])
+    if isinstance(detector, dict):
+        boxes = detector.get("boxes") or ()
+        width = width or detector.get("width")
+        height = height or detector.get("height")
+    else:
+        boxes = getattr(detector, "boxes", ()) or ()
+    normalized: list[dict[str, Any]] = []
+    for box in boxes:
+        if isinstance(box, dict):
+            coordinate = box.get("coordinate") or box.get("bbox") or box.get("box")
+            label = box.get("label") or box.get("kind") or "body"
+            score = box.get("score", box.get("confidence", 0.0))
+        else:
+            coordinate = getattr(box, "coordinate", None) or getattr(box, "bbox", None)
+            label = getattr(box, "label", "body")
+            score = getattr(box, "score", getattr(box, "confidence", 0.0))
+        if coordinate is None or len(coordinate) < 4:
+            continue
+        normalized.append(
+            {
+                "coordinate": [float(value) for value in tuple(coordinate)[:4]],
+                "label": str(label),
+                "score": float(score or 0.0),
+            }
+        )
+    return normalized, int(width) if width else None, int(height) if height else None
+
+
+def _collect_layout_model_regions(
+    *,
+    pipeline: Any,
+    input_path: Path,
+    page_indices: list[int],
+    page_image_max_pixels: int,
+    page_image_jpeg_quality: int,
+    output_dir: Path,
+    raise_if_timed_out: Any,
+    cancel_path: Path,
+) -> dict[int, dict[str, Any]]:
+    """对复杂文字页运行版面检测，结果只回填区域，不替换原生文字。"""
+    result: dict[int, dict[str, Any]] = {}
+    layout_dir = output_dir / "layout_pages"
+    layout_dir.mkdir(parents=True, exist_ok=True)
+    temporary_images: list[tuple[int, Path]] = []
+    try:
+        for index in page_indices:
+            _raise_if_cancelled(cancel_path)
+            raise_if_timed_out("layout_model_page_started")
+            image_bytes = render_page_image(
+                input_path,
+                index,
+                max_pixels=page_image_max_pixels,
+                jpeg_quality=page_image_jpeg_quality,
+            )
+            temporary_image = layout_dir / f"page_{index + 1}.jpg"
+            temporary_image.write_bytes(image_bytes)
+            temporary_images.append((index, temporary_image))
+
+        _raise_if_cancelled(cancel_path)
+        raise_if_timed_out("layout_model_batch_started")
+        candidates = pipeline.predict_iter(
+            [str(path) for _, path in temporary_images]
+        )
+        for (index, _), page_result in zip(temporary_images, candidates):
+            boxes, pixel_width, pixel_height = _layout_detection_boxes(page_result)
+            if boxes:
+                result[index + 1] = {
+                    "detections": boxes,
+                    "pixel_width": pixel_width,
+                    "pixel_height": pixel_height,
+                    "trigger": "complex_text_page",
+                }
+    finally:
+        for _, temporary_image in temporary_images:
+            temporary_image.unlink(missing_ok=True)
+    return result
 
 
 def _prepare_fonts(
@@ -427,6 +555,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             {"parsing_res_list": []} for _ in range(page_count)
         ]
         ocr_quality: list[dict[str, Any] | None] = [None] * page_count
+        pipeline: Any = None
         if ocr_indices:
             model_started = time.perf_counter()
             writer.emit(
@@ -546,14 +675,71 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             )
             ocr_budget_active = False
 
+        layout_model_regions: dict[int, dict[str, Any]] = {}
+        text_page_indices = [
+            index for index, value in enumerate(page_routes) if value == "text"
+        ]
+        complex_text_indices = [
+            index
+            for index in text_page_indices
+            if analysis is not None
+            and index < len(analysis.pages)
+            and int(analysis.pages[index].text_char_count) >= int(
+                payload.get("layout_model_min_chars", 500)
+            )
+        ]
+        if (
+            complex_text_indices
+            and bool(payload.get("layout_model_enabled", True))
+        ):
+            model_started = time.perf_counter()
+            writer.emit(
+                "layout_model_started",
+                progress=45,
+                route=route,
+                route_reason=route_reason,
+                page_count=len(complex_text_indices),
+                trigger="complex_text_page",
+            )
+            try:
+                layout_pipeline = _get_layout_pipeline(engine)
+                layout_model_regions = _collect_layout_model_regions(
+                    pipeline=layout_pipeline,
+                    input_path=input_path,
+                    page_indices=complex_text_indices,
+                    page_image_max_pixels=int(payload["page_image_max_pixels"]),
+                    page_image_jpeg_quality=int(payload["page_image_jpeg_quality"]),
+                    output_dir=output_path.parent,
+                    raise_if_timed_out=raise_if_timed_out,
+                    cancel_path=cancel_path,
+                )
+                writer.emit(
+                    "layout_model_completed",
+                    progress=52,
+                    route=route,
+                    route_reason=route_reason,
+                    page_count=len(complex_text_indices),
+                    region_page_count=len(layout_model_regions),
+                    region_count=sum(
+                        len(item.get("detections", ()))
+                        for item in layout_model_regions.values()
+                    ),
+                    elapsed_sec=round(time.perf_counter() - model_started, 3),
+                )
+            except Exception as error:
+                writer.emit(
+                    "layout_model_failed",
+                    progress=52,
+                    route=route,
+                    route_reason=route_reason,
+                    error=f"{type(error).__name__}: {error}",
+                    elapsed_sec=round(time.perf_counter() - model_started, 3),
+                )
+
         layout = None
         if any(value == "text" for value in page_routes):
             layout_started = time.perf_counter()
-            text_page_indices = {
-                index
-                for index, value in enumerate(page_routes)
-                if value == "text"
-            }
+            text_page_indices = set(text_page_indices)
             writer.emit(
                 "text_layout_started",
                 progress=60,
@@ -589,6 +775,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 block_reading_order_fallback_enabled=bool(
                     payload.get("block_reading_order_fallback_enabled", True)
                 ),
+                model_regions_by_page=layout_model_regions,
             )
             writer.emit(
                 "text_layout_completed",
@@ -703,13 +890,24 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             for block in page.blocks
             if not str(block.source).startswith("header_footer")
         ]
-        source_char_ids = tuple(
+        ir_source_char_ids = tuple(
             dict.fromkeys(
                 char_id
                 for block in source_blocks
                 for char_id in block.meta.get("source_char_ids", ())
             )
         )
+        ir_source_char_id_set = set(ir_source_char_ids)
+        layout_source_char_ids = tuple(
+            dict.fromkeys(
+                char_id
+                for page in (layout.pages if layout is not None else ())
+                for line in page.lines
+                for char_id in line.source_char_ids
+                if char_id in ir_source_char_id_set
+            )
+        )
+        source_char_ids = layout_source_char_ids or ir_source_char_ids
         export_report = quality.get("structured") or quality.get("fidelity") or {}
         placements = list(export_report.get("placements") or [])
         if not placements:
@@ -718,9 +916,39 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 for page_report in export_report.get("pages", [])
                 for placement in page_report.get("placements", [])
             ]
-        source_text = "".join(block.text for block in source_blocks if block.text)
+        positioned_block_ids = {
+            str(placement.get("block_id"))
+            for placement in placements
+            if placement.get("reason") == "positioned_text"
+        }
+        source_text_parts: list[str] = []
+        previous_kind = ""
+        for block in source_blocks:
+            block_text = _quality_source_block_text(block)
+            if not block_text:
+                continue
+            if (
+                block.kind == "bullet"
+                and str(block.block_id) in positioned_block_ids
+                and not str(block_text).lstrip().startswith("•")
+            ):
+                block_text = f"• {block_text}"
+            if source_text_parts and not (
+                previous_kind == "formula" and block.kind == "formula"
+            ):
+                source_text_parts.append("\n")
+            source_text_parts.append(
+                re.sub(r"\s+", "", block_text)
+                if block.kind == "formula"
+                else block_text
+            )
+            previous_kind = block.kind
+        source_text = "".join(source_text_parts)
         try:
-            output_text = read_docx_text(output_path)
+            output_text = read_docx_text(
+                output_path,
+                include_headers_footers=False,
+            )
         except Exception as error:
             output_text = ""
             quality["content_readback_error"] = (
@@ -733,13 +961,74 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 source_text=source_text,
                 output_text=output_text,
             )
+            if (
+                quality["final_content"]["status"] == "failed"
+                and formula_text_exception_is_local(
+                    source_blocks=source_blocks,
+                    placements=placements,
+                    output_text=output_text,
+                )
+            ):
+                text_check = next(
+                    (
+                        check
+                        for check in quality["final_content"]["checks"]
+                        if check["name"] == "text_content_presence"
+                    ),
+                    None,
+                )
+                if text_check is not None and text_check["status"] == "failed":
+                    text_check["status"] = "unverified"
+                    text_check["detail"] = (
+                        "公式块已进入 OMML，连续文本回读无法独立确认；"
+                        "字符归属检查仍保留"
+                    )
+                    if not any(
+                        check["status"] == "failed"
+                        for check in quality["final_content"]["checks"]
+                    ):
+                        quality["final_content"]["status"] = "unverified"
         else:
             quality["final_content"] = {
-                "status": "not_applicable",
-                "checks": [],
+                "status": "unverified",
+                "checks": [
+                    {
+                        "name": "source_character_coverage",
+                        "status": "unverified",
+                        "detail": "OCR 或其他路径未提供独立的源字符归属清单",
+                        "required": True,
+                    },
+                    {
+                        "name": "text_content_presence",
+                        "status": "unverified",
+                        "detail": "缺少独立的源文本与字符级归属证据",
+                        "required": True,
+                    },
+                ],
                 "source_character_count": 0,
                 "output_character_mapping_count": 0,
             }
+        source_audit = audit_pdfium_source_characters(
+            input_path,
+            source_char_ids=source_char_ids,
+        )
+        quality["source_audit"] = {
+            **source_audit,
+            "source": (
+                "pdf_text_layout"
+                if layout_source_char_ids
+                else "ir_blocks"
+                if ir_source_char_ids
+                else "unavailable"
+            ),
+            "status": source_audit.get("status", "unverified"),
+            "provenance": (
+                f"{source_audit.get('provenance')}; filtered_layout_source_ids"
+                if layout_source_char_ids
+                else source_audit.get("provenance", "unavailable")
+            ),
+            "ir_character_count": len(ir_source_char_ids),
+        }
         font_usage_report = ir.font_usage()
         font_plan_report = font_plan.report() if font_plan is not None else None
         quality["fonts"] = {
@@ -875,6 +1164,7 @@ from .worker.progress import (  # noqa: F401  # 保持原导入路径可用
     _Cancelled,
     _ProgressWriter,
     _TimedOut,
+    _get_layout_pipeline,
     _get_pipeline,
     _is_cancelled,
     _raise_if_cancelled,
@@ -885,5 +1175,6 @@ from .worker.quality import (  # noqa: F401  # 保持原导入路径可用
     _evaluate_quality_gate,
     _merge_render_validation,
     evaluate_final_content_quality,
+    formula_text_exception_is_local,
     read_docx_text,
 )

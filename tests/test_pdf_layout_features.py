@@ -250,6 +250,43 @@ class PdfLayoutFeaturesTest(unittest.TestCase):
             self.assertAlmostEqual(image_block.bbox[2], 250.0, places=1)
             self.assertAlmostEqual(image_block.bbox[3], 250.0, places=1)
 
+    def test_stretched_single_pixel_images_form_native_table_borders(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pixel_path = root / "pixel.png"
+            pdf_path = root / "raster-border-table.pdf"
+            Image.new("RGB", (1, 1), color=(0, 0, 0)).save(pixel_path)
+
+            canvas = Canvas(str(pdf_path), pagesize=(360, 300))
+            for y in (260, 220, 180, 140):
+                canvas.drawImage(
+                    ImageReader(str(pixel_path)),
+                    40,
+                    y,
+                    width=200,
+                    height=0.5,
+                )
+            for x in (40, 120, 200, 240):
+                canvas.drawImage(
+                    ImageReader(str(pixel_path)),
+                    x,
+                    140,
+                    width=0.5,
+                    height=120,
+                )
+            for row_index, y in enumerate((230, 190, 150)):
+                for column_index, x in enumerate((45, 125, 205)):
+                    canvas.drawString(x, y, f"{row_index}{column_index}")
+            canvas.save()
+
+            page = extract_pdf_layout(pdf_path).pages[0]
+
+            self.assertEqual(len(page.tables), 1)
+            self.assertEqual(page.tables[0].rows[0], ("00", "01", "02"))
+            self.assertEqual(page.tables[0].rows[2], ("20", "21", "22"))
+            self.assertEqual(page.images, ())
+
+
 
     def test_embedded_image_respects_pixel_limit(self) -> None:
         with TemporaryDirectory() as temporary_directory:

@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..run_validation import build_pipeline
+from ..run_validation import build_layout_detection_pipeline, build_pipeline
 
 
 _PIPELINES: dict[str, Any] = {}
+_LAYOUT_PIPELINES: dict[str, Any] = {}
 
 
 class _Cancelled(Exception):
@@ -87,6 +88,14 @@ def _get_pipeline(engine: str) -> Any:
     if pipeline is None:
         pipeline = build_pipeline(engine)
         _PIPELINES[engine] = pipeline
+    return pipeline
+
+
+def _get_layout_pipeline(engine: str = "structure-lite") -> Any:
+    pipeline = _LAYOUT_PIPELINES.get(engine)
+    if pipeline is None:
+        pipeline = build_layout_detection_pipeline()
+        _LAYOUT_PIPELINES[engine] = pipeline
     return pipeline
 
 

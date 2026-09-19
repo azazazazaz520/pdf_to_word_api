@@ -5,7 +5,7 @@
 """
 
 from __future__ import annotations
-from typing import Any
+from typing import Any, Iterable
 import math
 from .models import (
     PdfVectorObject,
@@ -15,6 +15,7 @@ from .models import (
     _MIN_VERTICAL_LINE_LENGTH,
     _HorizontalLine,
     _VerticalLine,
+    PdfImageBlock,
 )
 from .text import (
     _object_fill_color,
@@ -95,6 +96,7 @@ def _cluster_vertical_lines(
 def _extract_vector_lines(
     page: Any,
     page_height: float,
+    raster_images: Iterable[PdfImageBlock] = (),
 ) -> tuple[list[_HorizontalLine], list[_VerticalLine]]:
     horizontal: list[_HorizontalLine] = []
     vertical: list[_VerticalLine] = []
@@ -128,6 +130,18 @@ def _extract_vector_lines(
                     )
                 )
             previous = (x, top)
+    for image in raster_images:
+        x0, top, x1, bottom = image.bbox
+        width = x1 - x0
+        height = bottom - top
+        if height <= _MAX_LINE_THICKNESS and width >= _MIN_HORIZONTAL_LINE_LENGTH:
+            horizontal.append(
+                _HorizontalLine(top=(top + bottom) / 2.0, x0=x0, x1=x1)
+            )
+        elif width <= _MAX_LINE_THICKNESS and height >= _MIN_VERTICAL_LINE_LENGTH:
+            vertical.append(
+                _VerticalLine(x=(x0 + x1) / 2.0, top=top, bottom=bottom)
+            )
     return _cluster_horizontal_lines(horizontal), _cluster_vertical_lines(vertical)
 
 

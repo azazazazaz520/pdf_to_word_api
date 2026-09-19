@@ -177,6 +177,8 @@ class PdfTextLine:
     source_char_ids: tuple[str, ...] = ()
     nominal_font_size: float = 0.0
     font_size_source: str = ""
+    region_id: str = ""
+    column_id: str | None = None
 
     @property
     def center_x(self) -> float:
@@ -334,6 +336,7 @@ class PdfTable:
     border_width: float = 0.0
     border_color: tuple[int, int, int] = (0, 0, 0)
     has_borders: bool = True
+    visible_row_boundaries: tuple[bool, ...] = ()
     z_order: int = 0
     source_char_ids: tuple[str, ...] = ()
 

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import re
 from typing import Any, Iterable
@@ -227,12 +227,17 @@ def normalize_model_regions(
     page_number: int,
     transform: PageCoordinateTransform,
     lines: Iterable[PdfTextLine] = (),
+    include_source_char_ids: bool = True,
 ) -> tuple[PdfLayoutRegion, ...]:
     """把版面模型输出适配成稳定的页面区域。"""
     regions: list[PdfLayoutRegion] = []
     for index, detection in enumerate(detections):
         if isinstance(detection, dict):
-            raw_bbox = detection.get("bbox") or detection.get("box")
+            raw_bbox = (
+                detection.get("bbox")
+                or detection.get("box")
+                or detection.get("coordinate")
+            )
             kind = str(detection.get("kind") or detection.get("label") or "body").lower()
             confidence = float(detection.get("confidence", detection.get("score", 0.0)) or 0.0)
             order_hint = detection.get("order_hint")
@@ -253,10 +258,87 @@ def normalize_model_regions(
                 confidence=max(0.0, min(1.0, confidence)),
                 source="layout-model",
                 order_hint=int(order_hint) if order_hint is not None else None,
-                source_char_ids=_source_ids_in_bbox(lines, bbox),
+                source_char_ids=(
+                    _source_ids_in_bbox(lines, bbox)
+                    if include_source_char_ids
+                    else ()
+                ),
             )
         )
     return tuple(regions)
+
+
+def _model_region_columns(
+    regions: Iterable[PdfLayoutRegion],
+    *,
+    page_width: float,
+) -> tuple[float, ...]:
+    """从模型正文区域的中心位置推断局部栏界。"""
+    centers = sorted(
+        (region.bbox[0] + region.bbox[2]) / 2.0
+        for region in regions
+        if region.kind not in {"table", "image", "figure", "chart"}
+        and region.bbox[2] - region.bbox[0] < page_width * 0.72
+    )
+    if len(centers) < 2:
+        return ()
+    clusters: list[list[float]] = []
+    for center in centers:
+        if clusters and center - clusters[-1][-1] <= page_width * 0.12:
+            clusters[-1].append(center)
+        else:
+            clusters.append([center])
+    if len(clusters) < 2:
+        return ()
+    centers = [sum(cluster) / len(cluster) for cluster in clusters]
+    return tuple(
+        (left + right) / 2.0 for left, right in zip(centers, centers[1:])
+    )
+
+
+def assign_model_regions_to_lines(
+    lines: Iterable[PdfTextLine],
+    *,
+    model_regions: Iterable[PdfLayoutRegion],
+    page_width: float,
+    tables: Iterable[PdfTable] = (),
+) -> tuple[tuple[PdfTextLine, ...], tuple[float, ...]]:
+    """将模型正文区域映射到原生行，并返回模型推断的栏界。"""
+    collected_lines = tuple(lines)
+    collected_regions = tuple(model_regions)
+    columns = _model_region_columns(collected_regions, page_width=page_width)
+    table_boxes = tuple(table.bbox for table in tables)
+    assigned: list[PdfTextLine] = []
+    for line in collected_lines:
+        line_bbox = (line.x0, line.top, line.x1, line.bottom)
+        if any(_intersection_area(line_bbox, bbox) > 0 for bbox in table_boxes):
+            assigned.append(line)
+            continue
+        candidates = [
+            region
+            for region in collected_regions
+            if region.kind not in {"table", "image", "figure", "chart"}
+            and _intersection_area(line_bbox, region.bbox) > 0
+        ]
+        if not candidates:
+            assigned.append(line)
+            continue
+        region = max(
+            candidates,
+            key=lambda item: _intersection_area(line_bbox, item.bbox)
+            / max(_bbox_area(line_bbox), 1.0),
+        )
+        if region.bbox[2] - region.bbox[0] >= page_width * 0.72:
+            region_id = "full-width"
+            column_id = None
+        else:
+            column_index = sum(line.center_x > boundary for boundary in columns)
+            region_id = f"column-{column_index}"
+            column_id = str(column_index)
+        assigned.append(
+            replace(line, region_id=region_id, column_id=column_id)
+        )
+    return tuple(assigned), columns
 
 
 def merge_region_sets(

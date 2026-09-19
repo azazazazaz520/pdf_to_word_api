@@ -22,14 +22,20 @@ from docx.shared import Inches, Pt, RGBColor
 
 from ..fonts.embedding import FontPlan, attach_embedded_fonts
 from ..ir.model import IRBlock, IRDocument, IRPage, IRTextLine
-from ..ooxml_positioning import detach_header_footer
+from ..ooxml_positioning import (
+    add_absolute_picture,
+    add_absolute_shape,
+    add_absolute_text_box,
+    detach_header_footer,
+    new_canvas_paragraph,
+    position_table,
+)
 from ..page_render import (
     _add_bookmark,
     _add_formula_omml_element,
     _add_toc_field,
     _bookmark_name,
 )
-from ..ooxml_positioning import add_absolute_picture, new_canvas_paragraph
 from .document_setup import (
     StageCallback,
     _notify_stage,
@@ -650,6 +656,57 @@ def _vector_union_bbox(page: IRPage) -> tuple[float, float, float, float] | None
     )
 
 
+def _dense_vector_is_form_background(
+    page: IRPage,
+    bbox: tuple[float, float, float, float],
+) -> bool:
+    """识别覆盖整页的表单矢量层，避免与可编辑正文重复栅格化。"""
+    page_area = max(float(page.width) * float(page.height), 1.0)
+    bbox_area = max(float(bbox[2] - bbox[0]), 0.0) * max(
+        float(bbox[3] - bbox[1]),
+        0.0,
+    )
+    text_count = sum(
+        block.kind in FLOW_TEXT_KINDS and bool(str(block.text or "").strip())
+        for block in page.body_blocks
+    )
+    return text_count >= 20 and bbox_area / page_area >= 0.70
+
+
+def _dense_form_background_blocks(page: IRPage) -> tuple[IRBlock, ...]:
+    """筛出密集表单中可独立重建的彩色大面积填充块。
+
+    这类块只承担底色。筛选条件限制为无描边、非白色且横向覆盖页面大部分
+    的矢量，避免把复选框和灰色字段块误当成页面背景。
+    """
+    selected: list[IRBlock] = []
+    minimum_width = max(float(page.width) * 0.75, 1.0)
+    for block in page.body_blocks:
+        if block.kind != "vector" or block.bbox is None:
+            continue
+        vector = block.vector
+        if vector is None:
+            continue
+        fill = getattr(vector, "fill_color", None)
+        if fill is None or getattr(vector, "stroke_color", None) is not None:
+            continue
+        if all(int(channel) >= 245 for channel in fill[:3]):
+            continue
+        x0, top, x1, bottom = (float(value) for value in block.bbox)
+        if x1 - x0 < minimum_width or bottom <= top:
+            continue
+        selected.append(block)
+    return tuple(
+        sorted(
+            selected,
+            key=lambda block: (
+                float(block.bbox[1]) if block.bbox is not None else 0.0,
+                float(block.bbox[0]) if block.bbox is not None else 0.0,
+            ),
+        )
+    )
+
+
 def _add_formula_block(
     document: Any,
     page: IRPage,
@@ -775,6 +832,7 @@ def _add_table_block(
     margin_points: float,
     max_fallback_pixels: int,
     report: dict[str, Any],
+    positioned: bool = False,
 ) -> Any | None:
     table = None
     existing_table_count = len(document.tables)
@@ -784,8 +842,12 @@ def _add_table_block(
                 document,
                 block.table,
                 bordered=bool(getattr(block.table, "has_borders", True)),
-                exact_widths=False,
+                exact_widths=positioned,
                 cell_vertical_alignment="top",
+                tight_cell_margins=positioned,
+                cell_padding_points=(0.0, 0.0) if positioned else None,
+                merge_cells=True,
+                empty_text=positioned,
             )
         elif block.kind == "html_table":
             table = _add_html_table(document, block.text)
@@ -1058,6 +1120,354 @@ def _add_page_block(
     return None
 
 
+def _add_positioned_text_block(
+    document: Any,
+    page: IRPage,
+    block: IRBlock,
+    *,
+    font_plan: FontPlan | None,
+    canvas_paragraph: Any,
+    report: dict[str, Any],
+) -> Any | None:
+    """把表单页的小文本块按源坐标写成可编辑的浮动段落。"""
+    if block.bbox is None:
+        return _add_page_block(
+            document,
+            page,
+            block,
+            source_pdf=None,
+            font_plan=font_plan,
+            margin_points=0.0,
+            max_fallback_pixels=1,
+            report=report,
+        )
+    lines = tuple(block.lines or ())
+    if not lines:
+        lines = (
+            IRTextLine(
+                text=str(block.text or ""),
+                bbox=tuple(float(value) for value in block.bbox),
+                font_name=str(getattr(block, "font_name", "") or ""),
+                font_size=float(getattr(block, "font_size", 0.0) or 8.0),
+                color=block.color,
+                bold=bool(getattr(block, "bold", False)),
+                italic=bool(getattr(block, "italic", False)),
+                alignment=str(getattr(block, "alignment", "") or "left"),
+                pdf_font_name=str(getattr(block, "pdf_font_name", "") or ""),
+            ),
+        )
+    first_paragraph = None
+    for line_index, line in enumerate(lines):
+        x0, top, x1, bottom = (float(value) for value in line.bbox)
+        width = max(x1 - x0, 1.0)
+        line_font_size = float(line.font_size or block.font_size or 8.0)
+        height = max(bottom - top, line_font_size, 1.0)
+        font_name, bold, italic = _planned_font(
+            font_plan,
+            raw_name=str(getattr(line, "pdf_font_name", "") or ""),
+            fallback_name=str(getattr(line, "font_name", "") or ""),
+            bold=bool(getattr(line, "bold", False)),
+            italic=bool(getattr(line, "italic", False)),
+        )
+        paragraph = add_absolute_text_box(
+            document,
+            x_points=x0,
+            y_points=top,
+            width_points=width,
+            height_points=height,
+            text=str(line.text or ""),
+            font_name=font_name,
+            font_size=line_font_size,
+            bold=bold,
+            italic=italic,
+            color=getattr(line, "color", None) or block.color,
+            alignment=str(getattr(line, "alignment", "") or block.alignment or "left"),
+            z_order=int(getattr(line, "z_order", 0) or 0),
+            object_id=5000 + len(report["placements"]) * 1000 + line_index,
+            name=f"positioned_text_{block.block_id or 'block'}",
+            paragraph=canvas_paragraph,
+        )
+        if first_paragraph is None:
+            first_paragraph = paragraph
+    report["text_paragraph_count"] += len(lines)
+    _record_placement(report, block, status="native", reason="positioned_text")
+    return first_paragraph
+
+
+def _positioned_table_cells(page: IRPage) -> tuple[tuple[Any, IRBlock], ...]:
+    cells: list[tuple[Any, IRBlock]] = []
+    for block in page.body_blocks:
+        if block.kind not in {"table", "html_table"}:
+            continue
+        table = getattr(block, "table", None)
+        for cell in getattr(table, "cells", ()) or ():
+            if str(getattr(cell, "text", "") or "").strip():
+                cells.append((cell, block))
+    return tuple(cells)
+
+
+def _positioned_text_is_table_cell_duplicate(
+    block: IRBlock,
+    table_cells: tuple[tuple[Any, IRBlock], ...],
+) -> bool:
+    lines = tuple(block.lines or ())
+    boxes = tuple(line.bbox for line in lines)
+    if not boxes and block.bbox is not None:
+        boxes = (block.bbox,)
+    if not boxes:
+        return False
+    covered_line_count = 0
+    for box in boxes:
+        line_center = (
+            (float(box[0]) + float(box[2])) / 2.0,
+            (float(box[1]) + float(box[3])) / 2.0,
+        )
+        for cell, _ in table_cells:
+            bbox = tuple(float(value) for value in cell.bbox)
+            if (
+                bbox[0] <= line_center[0] <= bbox[2]
+                and bbox[1] <= line_center[1] <= bbox[3]
+            ):
+                covered_line_count += 1
+                break
+    return covered_line_count > 0
+
+
+def _positioned_table_cell_lines(
+    cell: Any,
+) -> tuple[tuple[str, tuple[float, float, float, float], float], ...]:
+    """按 glyph 的页面位置恢复密集表格单元格中的文字行。"""
+    glyphs = tuple(getattr(cell, "glyphs", ()) or ())
+    if glyphs:
+        groups: list[list[Any]] = []
+        centers: list[float] = []
+        for glyph in sorted(glyphs, key=lambda item: (item.bbox[1], item.bbox[0])):
+            center_y = (float(glyph.bbox[1]) + float(glyph.bbox[3])) / 2.0
+            group_index = next(
+                (
+                    index
+                    for index, value in enumerate(centers)
+                    if abs(center_y - value) <= 3.0
+                ),
+                None,
+            )
+            if group_index is None:
+                centers.append(center_y)
+                groups.append([glyph])
+            else:
+                groups[group_index].append(glyph)
+                centers[group_index] = sum(
+                    (float(item.bbox[1]) + float(item.bbox[3])) / 2.0
+                    for item in groups[group_index]
+                ) / len(groups[group_index])
+        result: list[tuple[str, tuple[float, float, float, float], float]] = []
+        for group in sorted(groups, key=lambda items: min(item.bbox[1] for item in items)):
+            ordered = sorted(group, key=lambda item: item.bbox[0])
+            text = "".join(str(item.text or "") for item in ordered)
+            bbox = (
+                min(float(item.bbox[0]) for item in ordered),
+                min(float(item.bbox[1]) for item in ordered),
+                max(float(item.bbox[2]) for item in ordered),
+                max(float(item.bbox[3]) for item in ordered),
+            )
+            size = max(float(getattr(item, "font_size", 0.0) or 0.0) for item in ordered)
+            result.append((text, bbox, size))
+        return tuple(result)
+    raw_bbox = getattr(cell, "text_bbox", None) or getattr(cell, "bbox", None)
+    if raw_bbox is None or len(raw_bbox) < 4:
+        return ()
+    return (
+        (
+            str(getattr(cell, "text", "") or "").strip(),
+            tuple(float(value) for value in raw_bbox[:4]),
+            float(getattr(cell, "font_size", 0.0) or 0.0),
+        ),
+    )
+
+
+def _add_positioned_table_cell_text(
+    document: Any,
+    page: IRPage,
+    table_block: IRBlock,
+    *,
+    cells: tuple[Any, ...],
+    font_plan: FontPlan | None,
+    canvas_paragraph: Any,
+    report: dict[str, Any],
+) -> None:
+    fallback_font = str(getattr(table_block, "font_name", "") or "")
+    for cell_index, cell in enumerate(cells):
+        for line_index, (text, raw_bbox, glyph_size) in enumerate(
+            _positioned_table_cell_lines(cell)
+        ):
+            text = text.strip()
+            if not text:
+                continue
+            x0, top, width, height, fitted_size = _positioned_table_cell_metrics(
+                cell,
+                text,
+                raw_bbox,
+                glyph_size,
+            )
+            if width <= 0.0 or height <= 0.0:
+                continue
+            font_name, bold, italic = _planned_font(
+                font_plan,
+                raw_name="",
+                fallback_name=fallback_font,
+                bold=bool(getattr(cell, "bold", False)),
+                italic=False,
+            )
+            add_absolute_text_box(
+                document,
+                x_points=x0,
+                y_points=top,
+                width_points=width,
+                height_points=height,
+                text=text,
+                font_name=font_name,
+                font_size=fitted_size,
+                bold=bold,
+                italic=italic,
+                alignment=str(getattr(cell, "alignment", "") or "left"),
+                object_id=6000 + len(report["placements"]) * 10000 + cell_index * 100 + line_index,
+                name=f"positioned_table_cell_{table_block.block_id or 'table'}_{cell_index}_{line_index}",
+                paragraph=canvas_paragraph,
+            )
+
+
+def _positioned_table_cell_metrics(
+    cell: Any,
+    text: str,
+    raw_bbox: tuple[float, float, float, float],
+    glyph_size: float,
+) -> tuple[float, float, float, float, float]:
+    """为单元格定位文本框保留字形行距，同时不越过单元格边界。"""
+    x0, top, x1, bottom = (float(value) for value in raw_bbox)
+    if x1 <= x0 or bottom <= top:
+        return x0, top, 0.0, 0.0, 0.0
+    base_size = float(glyph_size or getattr(cell, "font_size", 0.0) or 8.0)
+    fitted_size = min(
+        base_size,
+        max(1.8, (x1 - x0) / max(len(text) * 0.68, 1.0)),
+    )
+    cell_bbox = tuple(
+        float(value) for value in (getattr(cell, "bbox", None) or raw_bbox)
+    )
+    cell_right = max(cell_bbox[2], x0 + 1.0)
+    width = min(max(x1 - x0 + 1.0, 1.0), max(cell_right - x0, 1.0))
+    height = max(bottom - top + 1.0, fitted_size * 1.2, 1.0)
+    return x0, top, width, height, fitted_size
+
+
+def _add_positioned_form_block(
+    document: Any,
+    page: IRPage,
+    block: IRBlock,
+    *,
+    source_pdf: Path | None,
+    font_plan: FontPlan | None,
+    canvas_paragraph: Any,
+    max_fallback_pixels: int,
+    report: dict[str, Any],
+) -> Any | None:
+    """渲染密集表单页，避免小块正文重新流式分页。"""
+    if block.kind in FLOW_TEXT_KINDS:
+        return _add_positioned_text_block(
+            document,
+            page,
+            block,
+            font_plan=font_plan,
+            canvas_paragraph=canvas_paragraph,
+            report=report,
+        )
+    if block.kind in {"table", "html_table"}:
+        table = _add_table_block(
+            document,
+            page,
+            block,
+            source_pdf=source_pdf,
+            margin_points=0.0,
+            max_fallback_pixels=max_fallback_pixels,
+            report=report,
+            positioned=True,
+        )
+        if table is not None and block.bbox is not None:
+            position_table(
+                table,
+                x_points=float(block.bbox[0]),
+                y_points=float(block.bbox[1]),
+                overlap=True,
+            )
+            _add_positioned_table_cell_text(
+                document,
+                page,
+                block,
+                cells=tuple(getattr(block.table, "cells", ()) or ()),
+                font_plan=font_plan,
+                canvas_paragraph=canvas_paragraph,
+                report=report,
+            )
+            _record_placement(
+                report,
+                block,
+                status="native",
+                reason="positioned_table",
+            )
+        else:
+            _record_placement(
+                report,
+                block,
+                status="skipped",
+                reason="positioned_table_unavailable",
+            )
+        return None
+    if block.kind == "formula":
+        return _add_positioned_text_block(
+            document,
+            page,
+            block,
+            font_plan=font_plan,
+            canvas_paragraph=canvas_paragraph,
+            report=report,
+        )
+    if block.kind in {"image", "page_image", "vector"}:
+        image_bytes = block.image_bytes
+        if image_bytes is None:
+            image_bytes = _render_block_region(
+                source_pdf,
+                page,
+                block,
+                max_pixels=max_fallback_pixels,
+            )
+        if image_bytes is None or block.bbox is None:
+            report["skipped_block_count"] += 1
+            _record_placement(report, block, status="skipped", reason="positioned_image_unavailable")
+            return None
+        x0, top, x1, bottom = (float(value) for value in block.bbox)
+        paragraph = canvas_paragraph
+        add_absolute_picture(
+            document,
+            image_bytes,
+            x_points=x0,
+            y_points=top,
+            width_points=max(x1 - x0, 1.0),
+            height_points=max(bottom - top, 1.0),
+            z_order=int(getattr(block, "z_order", 0) or 0),
+            object_id=4000 + len(report["placements"]),
+            name=f"positioned_{block.kind}_{block.block_id or 'block'}",
+            paragraph=paragraph,
+        )
+        report["image_count"] += 1
+        if block.kind == "page_image":
+            report["page_image_count"] += 1
+        _record_placement(report, block, status="native", reason="positioned_image")
+        return paragraph
+    report["skipped_block_count"] += 1
+    _record_placement(report, block, status="skipped", reason="positioned_kind_unsupported")
+    return None
+
+
 def export_structured_docx(
     ir: IRDocument,
     output_path: Path,
@@ -1116,6 +1526,7 @@ def export_structured_docx(
         "vector_image_fallback_count": 0,
         "vector_compacted_page_count": 0,
         "vector_skipped_count": 0,
+        "vector_background_shape_count": 0,
         "table_image_fallback_count": 0,
         "table_native_error_count": 0,
         "table_native_error_types": [],
@@ -1128,6 +1539,18 @@ def export_structured_docx(
     bookmark_id = 0
 
     for page_index, page in enumerate(ir.pages):
+        vector_blocks = [
+            block for block in page.body_blocks if block.kind == "vector"
+        ]
+        dense_vector_bbox = (
+            _vector_union_bbox(page)
+            if len(vector_blocks) > DENSE_VECTOR_LIMIT
+            else None
+        )
+        dense_vector_form_background = bool(
+            dense_vector_bbox is not None
+            and _dense_vector_is_form_background(page, dense_vector_bbox)
+        )
         section = (
             document.sections[0]
             if page_index == 0
@@ -1137,7 +1560,7 @@ def export_structured_docx(
             section,
             max(page.width / 72.0, 0.01),
             max(page.height / 72.0, 0.01),
-            margin_points / 72.0,
+            0.0 if dense_vector_form_background else margin_points / 72.0,
         )
         page_image_fallback = _should_use_page_image_fallback(
             page,
@@ -1195,14 +1618,105 @@ def export_structured_docx(
                 )
                 continue
         first_paragraph = None
-        vector_blocks = [
-            block for block in page.body_blocks if block.kind == "vector"
-        ]
-        dense_vector_bbox = (
-            _vector_union_bbox(page)
-            if len(vector_blocks) > DENSE_VECTOR_LIMIT
-            else None
-        )
+
+        if dense_vector_form_background:
+            positioned_canvas = new_canvas_paragraph(document)
+            background_blocks = _dense_form_background_blocks(page)
+            background_ids = {id(block) for block in background_blocks}
+            for background_index, block in enumerate(background_blocks):
+                vector = block.vector
+                if vector is None or block.bbox is None:
+                    continue
+                x0, top, x1, bottom = (float(value) for value in block.bbox)
+                add_absolute_shape(
+                    document,
+                    geometry="rect",
+                    x_points=x0,
+                    y_points=top,
+                    width_points=max(x1 - x0, 1.0),
+                    height_points=max(bottom - top, 1.0),
+                    fill_color=getattr(vector, "fill_color", None),
+                    line_color=None,
+                    z_order=-100 + background_index,
+                    behind_text=True,
+                    object_id=3000 + background_index,
+                    name=f"dense_form_background_{page.page_number}_{background_index}",
+                    paragraph=positioned_canvas,
+                )
+                report["vector_background_shape_count"] += 1
+                _record_placement(
+                    report,
+                    block,
+                    status="native",
+                    reason="dense_form_background_shape",
+                )
+            table_cells = _positioned_table_cells(page)
+            report["positioned_table_cell_count"] = report.get(
+                "positioned_table_cell_count", 0
+            ) + len(table_cells)
+            for block in page.body_blocks:
+                if block.kind == "vector":
+                    if id(block) in background_ids:
+                        continue
+                    report["vector_skipped_count"] += 1
+                    report["skipped_block_count"] += 1
+                    _record_placement(
+                        report,
+                        block,
+                        status="skipped",
+                        reason="dense_vector_form_background_skipped",
+                    )
+                    continue
+                is_table_cell_duplicate = (
+                    block.kind in FLOW_TEXT_KINDS
+                    and _positioned_text_is_table_cell_duplicate(block, table_cells)
+                )
+                if is_table_cell_duplicate:
+                    report["positioned_table_duplicate_block_count"] = report.get(
+                        "positioned_table_duplicate_block_count", 0
+                    ) + 1
+                    _record_placement(
+                        report,
+                        block,
+                        status="covered_by_table_cell",
+                        reason="positioned_table_cell_text",
+                    )
+                    continue
+                paragraph = _add_positioned_form_block(
+                    document,
+                    page,
+                    block,
+                    source_pdf=source_pdf,
+                    font_plan=font_plan,
+                    canvas_paragraph=positioned_canvas,
+                    max_fallback_pixels=max_fallback_pixels,
+                    report=report,
+                )
+                if first_paragraph is None and paragraph is not None:
+                    first_paragraph = paragraph
+            if first_paragraph is None:
+                first_paragraph = positioned_canvas
+            if include_bookmarks:
+                for entry in outline_by_page.get(page.page_number, []):
+                    bookmark_id += 1
+                    _add_bookmark(
+                        first_paragraph,
+                        name=_bookmark_name(
+                            str(entry.get("title") or ""),
+                            bookmark_id,
+                        ),
+                        bookmark_id=bookmark_id,
+                    )
+            report["vector_compacted_page_count"] += 1
+            _record_page_report(report, page, start_index=start_index)
+            _notify_stage(
+                stage_callback,
+                "structured_page_completed",
+                page=page.page_number,
+                page_count=len(ir.pages),
+            )
+            continue
+
         dense_vector_image = None
         if dense_vector_bbox is not None:
             dense_vector_block = IRBlock(
@@ -1348,6 +1862,16 @@ def export_structured_docx(
                         reason="formula_region_rasterized",
                     )
                     continue
+            if dense_vector_form_background and block.kind == "vector":
+                report["vector_skipped_count"] += 1
+                report["skipped_block_count"] += 1
+                _record_placement(
+                    report,
+                    block,
+                    status="skipped",
+                    reason="dense_vector_form_background_skipped",
+                )
+                continue
             if dense_vector_bbox is not None and block.kind == "vector":
                 if dense_vector_image is not None and not dense_vector_inserted:
                     image_block = IRBlock(

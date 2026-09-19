@@ -16,6 +16,7 @@ from src.layout.models import _TextCharacter
 from src.layout.text import (
     _build_text_line,
     _build_text_spans,
+    _geometry_character_groups,
     _extract_text_characters,
 )
 
@@ -158,6 +159,40 @@ class TextGeometryTest(unittest.TestCase):
         self.assertEqual("".join(span.text for span in line.spans), "a b")
         self.assertEqual("".join(glyph.text for glyph in line.glyphs), "a b")
 
+    def test_point_space_keeps_content_order_when_its_bbox_starts_early(self) -> None:
+        characters = [
+            self._character("F", x0=0.0, font_name="Regular", char_index=0),
+            self._character("o", x0=5.0, font_name="Regular", char_index=1),
+            self._character("r", x0=10.0, font_name="Regular", char_index=2),
+            _TextCharacter(
+                text=" ",
+                x0=14.9,
+                top=20.0,
+                x1=14.9,
+                bottom=20.0,
+                font_size=10.0,
+                char_index=3,
+            ),
+            self._character("t", x0=15.0, font_name="Regular", char_index=4),
+        ]
+
+        line = _build_text_line(characters, rotation=0.0)
+
+        self.assertIsNotNone(line)
+        self.assertEqual(line.text, "For t")
+
+    def test_known_pdfium_dash_encoding_is_normalized(self) -> None:
+        characters = [
+            self._character("Jan.", x0=0.0, font_name="Regular", char_index=0),
+            self._character("\ufffdC", x0=20.0, font_name="Regular", char_index=1),
+            self._character("Dec.", x0=25.0, font_name="Regular", char_index=2),
+        ]
+
+        line = _build_text_line(characters, rotation=0.0)
+
+        self.assertIsNotNone(line)
+        self.assertEqual(line.text, "Jan.–Dec.")
+
     def test_wrapped_line_hyphen_is_not_followed_by_extra_space(self) -> None:
         self.assertEqual(
             _join_wrapped_lines(["pre-", "trained"]),
@@ -184,7 +219,67 @@ class TextGeometryTest(unittest.TestCase):
                 if line.text in {"left", "right"}
             ]
 
-            self.assertEqual(row, ["left", "right"])
+        self.assertEqual(row, ["left", "right"])
+
+    def test_large_horizontal_glyph_does_not_merge_adjacent_small_row(self) -> None:
+        characters = [
+            _TextCharacter(
+                text="D",
+                x0=98.0,
+                top=27.0,
+                x1=102.0,
+                bottom=31.0,
+                font_size=6.0,
+                char_index=49,
+            ),
+            _TextCharacter(
+                text="e",
+                x0=102.0,
+                top=28.0,
+                x1=105.0,
+                bottom=31.0,
+                font_size=6.0,
+                char_index=50,
+            ),
+            _TextCharacter(
+                text="1",
+                x0=90.0,
+                top=27.0,
+                x1=98.0,
+                bottom=44.0,
+                font_size=20.0,
+                char_index=5,
+            ),
+            _TextCharacter(
+                text="U",
+                x0=98.0,
+                top=36.0,
+                x1=105.0,
+                bottom=44.0,
+                font_size=12.0,
+                char_index=10,
+            ),
+            _TextCharacter(
+                text="\ufffdC",
+                x0=105.0,
+                top=54.0,
+                x1=107.0,
+                bottom=55.0,
+                font_size=7.0,
+                char_index=193,
+            ),
+        ]
+
+        rows = _geometry_character_groups(characters)
+        texts = [
+            _build_text_line(row, rotation=rotation).text
+            for rotation, row in rows
+        ]
+
+        self.assertEqual(len(texts), 3)
+        self.assertIn("De", texts)
+        self.assertIn("1U", texts)
+        self.assertIn("–", texts)
 
     def test_rotated_text_is_not_merged_into_horizontal_line(self) -> None:
         with TemporaryDirectory() as temporary_directory:

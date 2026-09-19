@@ -41,7 +41,12 @@ import pypdfium2 as pdfium
 from ..fonts.resolver import FontMatch, PdfFontDescriptor, extract_pdf_font_descriptors
 from .models import PdfTable, PdfVectorObject
 from .reading_order import _detect_column_boundaries, _estimate_body_left
-from .regions import build_geometry_regions
+from .regions import (
+    assign_model_regions_to_lines,
+    build_geometry_regions,
+    normalize_model_regions,
+    PageCoordinateTransform,
+)
 
 def extract_pdf_layout(
     source_pdf: Path,
@@ -53,6 +58,7 @@ def extract_pdf_layout(
     include_fidelity: bool = False,
     block_reading_order_enabled: bool = True,
     block_reading_order_fallback_enabled: bool = True,
+    model_regions_by_page: dict[int, Any] | None = None,
 ) -> PdfDocumentLayout:
     """提取文本行、图片、几何表格和矢量对象，并按多栏阅读顺序重排。
 
@@ -72,6 +78,7 @@ def extract_pdf_layout(
     font_cache: dict[tuple[Any, ...], FontMatch] = {}
     document = pdfium.PdfDocument(str(source_pdf))
     pages: list[PdfPageLayout] = []
+    model_region_pages: list[tuple[Any, ...]] = []
     try:
         for page_number, page in enumerate(document, start=1):
             width, height = (float(value) for value in page.get_size())
@@ -91,20 +98,36 @@ def extract_pdf_layout(
                     styles=styles,
                     page_number=page_number,
                 )
-                tables = _find_tables(page, lines, height)
-                tables = (
-                    *tables,
-                    *_find_borderless_tables(
-                        lines,
-                        page_width=width,
-                        page_height=height,
-                        existing_tables=tables,
-                    ),
-                )
-                tables = tuple(sorted(tables, key=lambda table: table.bbox[1]))
-                raw_vectors = _extract_vector_objects(page, height)
-                if len(raw_vectors) >= 300:
-                    tables = ()
+                model_regions: tuple[Any, ...] = ()
+                model_page = (model_regions_by_page or {}).get(page_number)
+                if model_page:
+                    if isinstance(model_page, dict):
+                        detections = (
+                            model_page.get("detections")
+                            or model_page.get("boxes")
+                            or ()
+                        )
+                        pixel_width = float(model_page.get("pixel_width") or width)
+                        pixel_height = float(model_page.get("pixel_height") or height)
+                        rotation = int(model_page.get("rotation") or 0)
+                    else:
+                        detections = model_page
+                        pixel_width = width
+                        pixel_height = height
+                        rotation = 0
+                    model_regions = normalize_model_regions(
+                        detections,
+                        page_number=page_number,
+                        transform=PageCoordinateTransform(
+                            pixel_width,
+                            pixel_height,
+                            width,
+                            height,
+                            rotation=rotation,
+                        ),
+                        lines=lines,
+                        include_source_char_ids=False,
+                    )
                 if (
                     include_page_images is not None
                     and (page_number - 1) not in include_page_images
@@ -118,7 +141,38 @@ def extract_pdf_layout(
                         max_pixels=image_max_pixels,
                         png_optimize=image_png_optimize,
                         jpeg_quality=image_jpeg_quality,
+                        include_raster_lines=True,
                     )
+                tables = _find_tables(
+                    page,
+                    lines,
+                    height,
+                    raster_images=tuple(
+                        image for image in images if image.source == "raster-line"
+                    ),
+                )
+                tables = (
+                    *tables,
+                    *_find_borderless_tables(
+                        lines,
+                        page_width=width,
+                        page_height=height,
+                        existing_tables=tables,
+                        confirmed_regions=model_regions,
+                    ),
+                )
+                tables = tuple(sorted(tables, key=lambda table: table.bbox[1]))
+                raw_vectors = _extract_vector_objects(page, height)
+                table_border_bboxes = tuple(table.bbox for table in tables)
+                images = tuple(
+                    image
+                    for image in images
+                    if image.source != "raster-line"
+                    or not any(
+                        _bbox_contains(table_bbox, image.bbox, tolerance=2.0)
+                        for table_bbox in table_border_bboxes
+                    )
+                )
                 vectors: tuple[PdfVectorObject, ...] = ()
                 if include_fidelity:
                     vectors = _filter_table_border_vectors(
@@ -138,6 +192,7 @@ def extract_pdf_layout(
                     vectors=vectors,
                 )
             )
+            model_region_pages.append(model_regions)
     finally:
         document.close()
 
@@ -153,10 +208,9 @@ def extract_pdf_layout(
         )
         for page in updated_pages
     )
-    updated_pages = tuple(
-        replace(
-            page,
-            regions=build_geometry_regions(
+    region_pages: list[PdfPageLayout] = []
+    for index, page in enumerate(updated_pages):
+        geometry_regions = build_geometry_regions(
                 page_number=index + 1,
                 page_width=page.width,
                 page_height=page.height,
@@ -165,10 +219,23 @@ def extract_pdf_layout(
                 images=page.images,
                 vectors=page.vectors,
                 columns=page.columns,
-            ),
         )
-        for index, page in enumerate(updated_pages)
-    )
+        model_regions = model_region_pages[index]
+        assigned_lines, model_columns = assign_model_regions_to_lines(
+            page.lines,
+            model_regions=model_regions,
+            page_width=page.width,
+            tables=page.tables,
+        )
+        region_pages.append(
+            replace(
+                page,
+                lines=assigned_lines,
+                columns=model_columns or page.columns,
+                regions=(*geometry_regions, *model_regions),
+            )
+        )
+    updated_pages = tuple(region_pages)
     if include_fidelity:
         updated_pages = tuple(
             replace(
@@ -232,6 +299,20 @@ def extract_pdf_layout(
         )
     updated_pages = tuple(ordered_pages)
     return PdfDocumentLayout(pages=updated_pages)
+
+
+def _bbox_contains(
+    outer: tuple[float, float, float, float],
+    inner: tuple[float, float, float, float],
+    *,
+    tolerance: float,
+) -> bool:
+    return (
+        inner[0] >= outer[0] - tolerance
+        and inner[1] >= outer[1] - tolerance
+        and inner[2] <= outer[2] + tolerance
+        and inner[3] <= outer[3] + tolerance
+    )
 
 
 def _filter_table_border_vectors(

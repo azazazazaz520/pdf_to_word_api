@@ -60,6 +60,7 @@
 ## Git 与提交
 
 - 只有用户明确要求提交时，代理才可以创建 Git commit。
+- 提交信息使用中文。
 - 提交信息遵循 Conventional Commits，格式为：
 
   ```text
